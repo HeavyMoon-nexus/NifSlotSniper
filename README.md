@@ -20,7 +20,7 @@ flowchart
         NSS -.-> OspOut["Changed .nif<br>(for BodySlide)"]:::file
     end
 
-    subgraph Step3["<div style='min-width: 250px'>Step 3: Finalize&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp</div>"]
+    subgraph Step3["<div style='min-width: 500px'>Step 3: Finalize&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp</div>"]
         direction TB
         NifOut ==> NifFold[Place it in the right place]:::anda
         D ==> E[Synthesis<br>slotIMporter]:::tool
