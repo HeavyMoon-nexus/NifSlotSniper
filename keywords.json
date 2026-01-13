@@ -1,0 +1,1026 @@
+[
+    {
+        "keyword": "AND_CoversAll",
+        "match_words": [
+            "top"
+        ],
+        "slots": [
+            "32"
+        ]
+    },
+    {
+        "keyword": "AND_NearlyNaked",
+        "match_words": [
+            "top",
+            "upper",
+            "lower",
+            "bottom",
+            "transparent"
+        ],
+        "slots": [
+            "32"
+        ]
+    },
+    {
+        "keyword": "sla_ArmorPretty",
+        "match_words": [
+            "top",
+            "upper",
+            "lower",
+            "bottom",
+            "transparent"
+        ],
+        "slots": [
+            "32",
+            "52",
+            "56"
+        ]
+    },
+    {
+        "keyword": "EroticArmor",
+        "match_words": [
+            "top",
+            "upper",
+            "lower",
+            "bottom",
+            "transparent"
+        ],
+        "slots": [
+            "32",
+            "52",
+            "56"
+        ]
+    },
+    {
+        "keyword": "sla_ArmorSpandex",
+        "match_words": [
+            "top",
+            "upper",
+            "lower",
+            "bottom"
+        ],
+        "slots": [
+            "32",
+            "52",
+            "56"
+        ]
+    },
+    {
+        "keyword": "SLA_ArmorLewdLeotard",
+        "match_words": [
+            "top",
+            "upper",
+            "lower",
+            "bottom"
+        ],
+        "slots": [
+            "32",
+            "52",
+            "56"
+        ]
+    },
+    {
+        "keyword": "SLA_ArmorCurtain",
+        "match_words": [
+            "top",
+            "upper",
+            "lower",
+            "bottom"
+        ],
+        "slots": [
+            "32",
+            "52",
+            "56"
+        ]
+    },
+    {
+        "keyword": "SLA_ArmorTransparent",
+        "match_words": [
+            "top",
+            "upper",
+            "lower",
+            "bottom",
+            "transparent"
+        ],
+        "slots": [
+            "32",
+            "52",
+            "56"
+        ]
+    },
+    {
+        "keyword": "SLA_HalfNakedBikini",
+        "match_words": [
+            "top",
+            "upper",
+            "lower",
+            "bottom",
+            "kini"
+        ],
+        "slots": [
+            "32",
+            "52",
+            "56"
+        ]
+    },
+    {
+        "keyword": "SLA_ArmorHalfNaked",
+        "match_words": [
+            "top",
+            "upper",
+            "lower",
+            "bottom",
+            "naked"
+        ],
+        "slots": [
+            "32",
+            "52",
+            "56"
+        ]
+    },
+    {
+        "keyword": "SLA_ArmorCapeFull",
+        "match_words": [
+            "top",
+            "upper",
+            "lower",
+            "bottom",
+            "cape"
+        ],
+        "slots": [
+            "32",
+            "52",
+            "56"
+        ]
+    },
+    {
+        "keyword": "SLA_ArmorCapeMini",
+        "match_words": [
+            "top",
+            "upper",
+            "lower",
+            "bottom",
+            "cape"
+        ],
+        "slots": [
+            "32",
+            "52",
+            "56"
+        ]
+    },
+    {
+        "keyword": "AND_ArmorTop",
+        "match_words": [
+            "top",
+            "upper"
+        ],
+        "slots": [
+            "32",
+            "56",
+            "47",
+            "58",
+            "59"
+        ]
+    },
+    {
+        "keyword": "AND_ArmorTopT",
+        "match_words": [
+            "top",
+            "upper"
+        ],
+        "slots": [
+            "32",
+            "56",
+            "47",
+            "58",
+            "59"
+        ]
+    },
+    {
+        "keyword": "AND_ArmorTop_NoCover",
+        "match_words": [
+            "top",
+            "upper"
+        ],
+        "slots": [
+            "32",
+            "56",
+            "47",
+            "58",
+            "59"
+        ]
+    },
+    {
+        "keyword": "AND_Bra",
+        "match_words": [
+            "top",
+            "upper"
+        ],
+        "slots": [
+            "56"
+        ]
+    },
+    {
+        "keyword": "AND_BraT",
+        "match_words": [
+            "top",
+            "upper",
+            "transparent"
+        ],
+        "slots": [
+            "56"
+        ]
+    },
+    {
+        "keyword": "AND_Bra_NoCover",
+        "match_words": [
+            "top",
+            "upper"
+        ],
+        "slots": [
+            "56",
+            "57",
+            "58",
+            "59"
+        ]
+    },
+    {
+        "keyword": "Sla_BraBikini",
+        "match_words": [
+            "bra",
+            "kini"
+        ],
+        "slots": [
+            "56",
+            "32"
+        ]
+    },
+    {
+        "keyword": "AND_ChestCurtain",
+        "match_words": [
+            "top",
+            "upper"
+        ],
+        "slots": [
+            "32",
+            "56"
+        ]
+    },
+    {
+        "keyword": "AND_ChestCurtainT",
+        "match_words": [
+            "top",
+            "upper",
+            "transparent"
+        ],
+        "slots": [
+            "32",
+            "56"
+        ]
+    },
+    {
+        "keyword": "AND_ChestFlashRisk",
+        "match_words": [
+            "top",
+            "upper"
+        ],
+        "slots": [
+            "32",
+            "56"
+        ]
+    },
+    {
+        "keyword": "AND_ChestFlashRiskHigh",
+        "match_words": [
+            "top",
+            "upper"
+        ],
+        "slots": [
+            "32",
+            "56"
+        ]
+    },
+    {
+        "keyword": "AND_ChestFlashRiskExtreme",
+        "match_words": [
+            "top",
+            "upper"
+        ],
+        "slots": [
+            "32",
+            "56"
+        ]
+    },
+    {
+        "keyword": "AND_ChestFlashRiskUltra",
+        "match_words": [
+            "top",
+            "upper"
+        ],
+        "slots": [
+            "32",
+            "56"
+        ]
+    },
+    {
+        "keyword": "AND_NipplePasties",
+        "match_words": [
+            "top",
+            "upper",
+            "nipple",
+            "pasties"
+        ],
+        "slots": [
+            "56"
+        ]
+    },
+    {
+        "keyword": "SLA_PiercingNipple",
+        "match_words": [
+            "pierce",
+            "nipple"
+        ],
+        "slots": [
+            "56"
+        ]
+    },
+    {
+        "keyword": "AND_ArmorBottom",
+        "match_words": [
+            "pants",
+            "lower"
+        ],
+        "slots": [
+            "32",
+            "53",
+            "54"
+        ]
+    },
+    {
+        "keyword": "AND_ArmorBottomT",
+        "match_words": [
+            "pants",
+            "lower"
+        ],
+        "slots": [
+            "32",
+            "53",
+            "54"
+        ]
+    },
+    {
+        "keyword": "AND_ArmorBottom_NoCover",
+        "match_words": [
+            "pants",
+            "lower"
+        ],
+        "slots": [
+            "32",
+            "53",
+            "54"
+        ]
+    },
+    {
+        "keyword": "AND_Hotpants",
+        "match_words": [
+            "pants",
+            "lower"
+        ],
+        "slots": [
+            "49"
+        ]
+    },
+    {
+        "keyword": "AND_HotpantsT",
+        "match_words": [
+            "pants",
+            "lower",
+            "transparent"
+        ],
+        "slots": [
+            "49"
+        ]
+    },
+    {
+        "keyword": "SLA_MicroHotpants",
+        "match_words": [
+            "pants",
+            "lower"
+        ],
+        "slots": [
+            "49"
+        ]
+    },
+    {
+        "keyword": "SLA_HasLeggings",
+        "match_words": [],
+        "slots": [
+            "37",
+            "38"
+        ]
+    },
+    {
+        "keyword": "AND_Microskirt",
+        "match_words": [
+            "skirt",
+            "lower"
+        ],
+        "slots": [
+            "52",
+            "49",
+            "32"
+        ]
+    },
+    {
+        "keyword": "SLA_MicroSkirt",
+        "match_words": [
+            "skirt",
+            "lower"
+        ],
+        "slots": [
+            "52",
+            "49",
+            "32"
+        ]
+    },
+    {
+        "keyword": "AND_Miniskirt",
+        "match_words": [
+            "skirt",
+            "lower"
+        ],
+        "slots": [
+            "52",
+            "49",
+            "32"
+        ]
+    },
+    {
+        "keyword": "AND_MiniskirtT",
+        "match_words": [
+            "skirt",
+            "lower"
+        ],
+        "slots": [
+            "52",
+            "49",
+            "32"
+        ]
+    },
+    {
+        "keyword": "SLA_MiniSkirt",
+        "match_words": [
+            "skirt",
+            "lower"
+        ],
+        "slots": [
+            "52",
+            "49",
+            "32"
+        ]
+    },
+    {
+        "keyword": "AND_ShowgirlSkirt",
+        "match_words": [
+            "skirt",
+            "lower"
+        ],
+        "slots": [
+            "52",
+            "49",
+            "32"
+        ]
+    },
+    {
+        "keyword": "AND_ShowgirlSkirtT",
+        "match_words": [
+            "skirt",
+            "lower"
+        ],
+        "slots": [
+            "52",
+            "49",
+            "32"
+        ]
+    },
+    {
+        "keyword": "SLA_ShowgirlSkirt",
+        "match_words": [
+            "skirt",
+            "lower"
+        ],
+        "slots": [
+            "52",
+            "49",
+            "32"
+        ]
+    },
+    {
+        "keyword": "SLA_FullSkirt",
+        "match_words": [
+            "skirt",
+            "lower"
+        ],
+        "slots": [
+            "52",
+            "49",
+            "32"
+        ]
+    },
+    {
+        "keyword": "AND_Thong",
+        "match_words": [
+            "underwear",
+            "panties",
+            "panty",
+            "Thong",
+            "lower"
+        ],
+        "slots": [
+            "52"
+        ]
+    },
+    {
+        "keyword": "AND_ThongT",
+        "match_words": [
+            "underwear",
+            "panties",
+            "panty",
+            "Thong",
+            "lower",
+            "transparent"
+        ],
+        "slots": [
+            "52"
+        ]
+    },
+    {
+        "keyword": "AND_Thong_NoCover",
+        "match_words": [
+            "underwear",
+            "panties",
+            "panty",
+            "Thong",
+            "lower"
+        ],
+        "slots": [
+            "52"
+        ]
+    },
+    {
+        "keyword": "AND_Underwear",
+        "match_words": [
+            "underwear",
+            "panties",
+            "panty",
+            "lower"
+        ],
+        "slots": [
+            "52"
+        ]
+    },
+    {
+        "keyword": "AND_Underwear_NoCover",
+        "match_words": [
+            "underwear",
+            "panties",
+            "panty",
+            "lower"
+        ],
+        "slots": [
+            "52"
+        ]
+    },
+    {
+        "keyword": "AND_UnderwearT",
+        "match_words": [
+            "underwear",
+            "panties",
+            "pantylower",
+            "transparent"
+        ],
+        "slots": [
+            "52"
+        ]
+    },
+    {
+        "keyword": "AND_CString",
+        "match_words": [
+            "underwear",
+            "panties",
+            "panty",
+            "lower",
+            "Cstring"
+        ],
+        "slots": [
+            "52"
+        ]
+    },
+    {
+        "keyword": "AND_CStringT",
+        "match_words": [
+            "underwear",
+            "panties",
+            "panty",
+            "lower",
+            "Cstring",
+            "transparent"
+        ],
+        "slots": [
+            "52"
+        ]
+    },
+    {
+        "keyword": "SLA_ThongT",
+        "match_words": [
+            "underwear",
+            "panties",
+            "panty",
+            "lower",
+            "Thong",
+            "transparent"
+        ],
+        "slots": [
+            "52"
+        ]
+    },
+    {
+        "keyword": "SLA_ThongLowleg",
+        "match_words": [],
+        "slots": []
+    },
+    {
+        "keyword": "SLA_ThongCString",
+        "match_words": [
+            "underwear",
+            "panties",
+            "panty",
+            "lower",
+            "Thong",
+            "Cstring"
+        ],
+        "slots": [
+            "52"
+        ]
+    },
+    {
+        "keyword": "SLA_ThongGString",
+        "match_words": [
+            "underwear",
+            "panties",
+            "panty",
+            "lower",
+            "Thong",
+            "Gstring"
+        ],
+        "slots": [
+            "52"
+        ]
+    },
+    {
+        "keyword": "SLA_PantsNormal",
+        "match_words": [
+            "pants",
+            "lower"
+        ],
+        "slots": [
+            "52"
+        ]
+    },
+    {
+        "keyword": "AND_PelvicCurtain",
+        "match_words": [
+            "skirt",
+            "lower"
+        ],
+        "slots": [
+            "52",
+            "49",
+            "32"
+        ]
+    },
+    {
+        "keyword": "AND_PelvicCurtainT",
+        "match_words": [
+            "skirt",
+            "lower",
+            "transparent"
+        ],
+        "slots": [
+            "52",
+            "49",
+            "32"
+        ]
+    },
+    {
+        "keyword": "AND_PelvicFlashRisk",
+        "match_words": [
+            "skirt",
+            "lower"
+        ],
+        "slots": [
+            "52",
+            "49",
+            "32"
+        ]
+    },
+    {
+        "keyword": "AND_PelvicFlashRiskLow",
+        "match_words": [
+            "skirt",
+            "lower"
+        ],
+        "slots": [
+            "52",
+            "49",
+            "32"
+        ]
+    },
+    {
+        "keyword": "AND_PelvicFlashRiskHigh",
+        "match_words": [
+            "skirt",
+            "lower"
+        ],
+        "slots": [
+            "52",
+            "49",
+            "32"
+        ]
+    },
+    {
+        "keyword": "AND_PelvicFlashRiskExtreme",
+        "match_words": [
+            "skirt",
+            "lower"
+        ],
+        "slots": [
+            "52",
+            "49",
+            "32"
+        ]
+    },
+    {
+        "keyword": "AND_PelvicFlashRiskUltra",
+        "match_words": [
+            "skirt",
+            "lower"
+        ],
+        "slots": [
+            "52",
+            "49",
+            "32"
+        ]
+    },
+    {
+        "keyword": "AND_AssCurtain",
+        "match_words": [
+            "skirt",
+            "lower"
+        ],
+        "slots": [
+            "52",
+            "49",
+            "32",
+            "47"
+        ]
+    },
+    {
+        "keyword": "AND_AssCurtainT",
+        "match_words": [
+            "skirt",
+            "lower",
+            "transparent"
+        ],
+        "slots": [
+            "52",
+            "49",
+            "32",
+            "47"
+        ]
+    },
+    {
+        "keyword": "AND_AssFlashRisk",
+        "match_words": [
+            "skirt",
+            "lower"
+        ],
+        "slots": [
+            "52",
+            "49",
+            "32",
+            "47"
+        ]
+    },
+    {
+        "keyword": "AND_AssFlashRiskLow",
+        "match_words": [
+            "skirt",
+            "lower"
+        ],
+        "slots": [
+            "52",
+            "49",
+            "32",
+            "47"
+        ]
+    },
+    {
+        "keyword": "AND_AssFlashRiskHigh",
+        "match_words": [
+            "skirt",
+            "lower"
+        ],
+        "slots": [
+            "52",
+            "49",
+            "32",
+            "47"
+        ]
+    },
+    {
+        "keyword": "AND_AssFlashRiskExtreme",
+        "match_words": [
+            "skirt",
+            "lower"
+        ],
+        "slots": [
+            "52",
+            "49",
+            "32",
+            "47"
+        ]
+    },
+    {
+        "keyword": "AND_AssFlashRiskUltra",
+        "match_words": [
+            "skirt",
+            "lower"
+        ],
+        "slots": [
+            "52",
+            "49",
+            "32",
+            "47"
+        ]
+    },
+    {
+        "keyword": "AND_VaginaPasties",
+        "match_words": [
+            "skirt",
+            "lower",
+            "Pasties"
+        ],
+        "slots": [
+            "52"
+        ]
+    },
+    {
+        "keyword": "SLA_AnalPlug",
+        "match_words": [
+            "plug",
+            "anal"
+        ],
+        "slots": [
+            "52"
+        ]
+    },
+    {
+        "keyword": "SLA_AnalPlugBeads",
+        "match_words": [
+            "plug",
+            "anal"
+        ],
+        "slots": [
+            "52"
+        ]
+    },
+    {
+        "keyword": "SLA_AnalPlugTail",
+        "match_words": [
+            "plug",
+            "anal"
+        ],
+        "slots": [
+            "52"
+        ]
+    },
+    {
+        "keyword": "SLA_VaginalBeads",
+        "match_words": [
+            "plug",
+            "bead",
+            "vagina"
+        ],
+        "slots": [
+            "52"
+        ]
+    },
+    {
+        "keyword": "SLA_VaginalDildo",
+        "match_words": [
+            "plug",
+            "dildo",
+            "vagina"
+        ],
+        "slots": [
+            "52"
+        ]
+    },
+    {
+        "keyword": "SLA_PiercingClit",
+        "match_words": [
+            "pierce",
+            "vagina",
+            "clit"
+        ],
+        "slots": [
+            "52"
+        ]
+    },
+    {
+        "keyword": "SLA_PiercingVulva",
+        "match_words": [
+            "pierce",
+            "vagina",
+            "clit"
+        ],
+        "slots": [
+            "52"
+        ]
+    },
+    {
+        "keyword": "SLA_BootsHeels",
+        "match_words": [
+            "Boots",
+            "heel",
+            "shoes"
+        ],
+        "slots": [
+            "37",
+            "38"
+        ]
+    },
+    {
+        "keyword": "SLA_KillerHeels",
+        "match_words": [
+            "Boots",
+            "heel",
+            "shoes"
+        ],
+        "slots": [
+            "37",
+            "38"
+        ]
+    },
+    {
+        "keyword": "SLA_HasStockings",
+        "match_words": [
+            "stocking"
+        ],
+        "slots": [
+            "37",
+            "38"
+        ]
+    },
+    {
+        "keyword": "SLA_Earrings",
+        "match_words": [
+            "Ear"
+        ],
+        "slots": [
+            "49"
+        ]
+    },
+    {
+        "keyword": "SLA_HasSleeves",
+        "match_words": [
+            "sleeve"
+        ],
+        "slots": [
+            "32"
+        ]
+    },
+    {
+        "keyword": "SLA_PiercingLips",
+        "match_words": [
+            "pierce",
+            "lip"
+        ],
+        "slots": [
+            "44",
+            "55"
+        ]
+    },
+    {
+        "keyword": "SLA_PiercingNose",
+        "match_words": [
+            "pierce",
+            "nose"
+        ],
+        "slots": [
+            "44",
+            "55"
+        ]
+    }
+]
