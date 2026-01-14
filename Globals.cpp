@@ -130,6 +130,17 @@ double g_LastMouseX = 0.0;
 double g_LastMouseY = 0.0;
 bool g_MouseInitialized = false;
 
+// カメラ注視モードの実体
+CamFocus g_CamFocus = CamFocus::Auto;
+int g_CamTargetMeshIndex = -1;
+
+// リファレンス用のZオフセット（UIで設定可能にする想定）
+float g_RefCamZOffset = 20.0f;
+
+// 既存の g_BodyCenter / g_RefBodyCenter の定義はそのまま残します。
+// （既にファイル内に g_BodyCenter / g_RefBodyCenter の初期化があるため追加の変更は不要）
+
+
 // ==========================================
 // 2. 関数の実装
 // ==========================================
@@ -207,6 +218,10 @@ std::vector<int> ParseSlotString(const std::string& slotStr) {
     }
     return slots;
 }
+//slotdata-*.txtの8-9列目のスロット数を数える
+int CountSlotsInString(const std::string& slotStr) {
+    return static_cast<int>(ParseSlotString(slotStr).size());
+}
 
 unsigned int CreateShader(const char* vSource, const char* fSource) {
     unsigned int v = glCreateShader(GL_VERTEX_SHADER); glShaderSource(v, 1, &vSource, NULL); glCompileShader(v);
@@ -256,14 +271,24 @@ void UpdateMeshListInternal(nifly::NifFile& targetNif, std::vector<RenderMesh>& 
         for (const auto& v : bsShape->vertData) rawVerts.push_back({ v.vert.x, v.vert.y, v.vert.z });
         if (rawVerts.empty()) continue;
 
-        if (!isRef) {
-            for (const auto& v : rawVerts) {
-                // NOMINMAX が効いているので glm::min が使えるはず
-                minBounds = glm::min(minBounds, glm::vec3(v.x, v.y, v.z));
-                maxBounds = glm::max(maxBounds, glm::vec3(v.x, v.y, v.z));
-            }
-            hasVertices = true;
+        // 各メッシュごとのローカルバウンディングを計算
+        glm::vec3 meshMin(99999.0f), meshMax(-99999.0f);
+        for (const auto& v : rawVerts) {
+            glm::vec3 vv(v.x, v.y, v.z);
+            meshMin = glm::min(meshMin, vv);
+            meshMax = glm::max(meshMax, vv);
         }
+        glm::vec3 meshCenter = (meshMin + meshMax) * 0.5f;
+        float meshRadius = 0.0f;
+        for (const auto& v : rawVerts) {
+            glm::vec3 vv(v.x, v.y, v.z);
+            meshRadius = std::max(meshRadius, glm::length(vv - meshCenter));
+        }
+
+        // 全体のバウンディング更新
+        minBounds = glm::min(minBounds, meshMin);
+        maxBounds = glm::max(maxBounds, meshMax);
+        hasVertices = true;
 
         std::string currentSlots = "None";
         std::vector<int> slotsFound;
@@ -296,6 +321,9 @@ void UpdateMeshListInternal(nifly::NifFile& targetNif, std::vector<RenderMesh>& 
         mesh.slotInfo = currentSlots;
         mesh.activeSlots = slotsFound;
         mesh.shapeIndex = (int)k;
+        // 追加: mesh 中心と半径を格納
+        mesh.center = meshCenter;
+        mesh.boundingRadius = (meshRadius > 0.0f) ? meshRadius : 1.0f;
 
         glGenVertexArrays(1, &mesh.VAO); glGenBuffers(1, &mesh.VBO); glGenBuffers(1, &mesh.EBO);
         glBindVertexArray(mesh.VAO);
@@ -306,7 +334,12 @@ void UpdateMeshListInternal(nifly::NifFile& targetNif, std::vector<RenderMesh>& 
         glBindVertexArray(0);
         outMeshes.push_back(std::move(mesh));
     }
-    if (!isRef && hasVertices) g_BodyCenter = (minBounds + maxBounds) * 0.5f;
+    // 全体中心の設定（isRef に合わせて body / ref を更新）
+    if (hasVertices) {
+        glm::vec3 overallCenter = (minBounds + maxBounds) * 0.5f;
+        if (!isRef) g_BodyCenter = overallCenter;
+        else g_RefBodyCenter = overallCenter;
+    }
 }
 
 std::string OpenFileDialog(const char* filter) {

@@ -160,6 +160,7 @@ void RenderSettingsWindow() {
                     ImGui::Text("%s", g_SourceBlockedList[i].c_str());
                 }
                 ImGui::EndChild();
+                ImGui::TextDisabled(".esp and .osp files that are not shown in the Nif Database appear here. \nYou can also add them to this block list by right-clicking them in the Nif Database.");
                 ImGui::EndTabItem();
             }
 
@@ -168,7 +169,7 @@ void RenderSettingsWindow() {
                 ImGui::TextDisabled("word to ignore (Auto-Fix):");
 
                 static char newKwBL[64] = "";
-                ImGui::InputText("word", newKwBL, 64);
+                ImGui::InputText("mesh name word", newKwBL, 64);
                 ImGui::SameLine();
                 if (ImGui::Button("Add") && strlen(newKwBL) > 0) {
                     g_KeywordBlockedList.push_back(newKwBL);
@@ -186,6 +187,27 @@ void RenderSettingsWindow() {
                     ImGui::Text("%s", g_KeywordBlockedList[i].c_str());
                 }
                 ImGui::EndChild();
+                ImGui::TextDisabled("Words in this block list are ignored during Auto-Fix/Suggest calculations, \nallowing you to skip items like collision bodies.\nYou can also add meshes to this block list by right-clicking them in the mesh list.");
+                ImGui::EndTabItem();
+            }
+            // --- Tab 4: View Settings (新規追加) ---
+            if (ImGui::BeginTabItem("View")) {
+                ImGui::Text("Camera Settings");
+                ImGui::Spacing();
+
+                // 高さ調整スライダー (範囲は -100 ～ 200 くらいあれば十分でしょう)
+                ImGui::Text("Reference Body Height Offset");
+                ImGui::DragFloat("##RefOffset", &g_RefCamZOffset, 0.5f, -100.0f, 300.0f, "%.1f");
+                if (ImGui::IsItemHovered()) ShowTooltip("Adjusts the vertical camera center when the Reference Body is visible.\nDefault is 80.0.");
+
+                ImGui::SameLine();
+                if (ImGui::Button("Reset##RefOffset")) {
+                    g_RefCamZOffset = 80.0f; // デフォルトに戻すボタン
+                }
+
+                ImGui::Separator();
+                ImGui::TextDisabled("Note: This setting is saved in config.ini\nThe view varies based on the reference body's collision floor mesh. \nAdjust it manually (3BA, BHUNP, SoftBody, etc).");
+
                 ImGui::EndTabItem();
             }
 

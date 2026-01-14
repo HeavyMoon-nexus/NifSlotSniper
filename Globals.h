@@ -28,6 +28,14 @@ extern const std::string CONFIG_FILENAME;
 
 enum class LogType { Info, Success, Warning, Error };
 
+// カメラの注視対象モード
+enum class CamFocus {
+    Auto = 0, // デフォルトの自動判定（参照がある場合は NIF を優先、ない場合は選択メッシュ優先）
+    Nif = 1,  // NIF 全体中心
+    Ref = 2,  // リファレンスボディ中心
+    Mesh = 3  // 個別メッシュ中心
+};
+
 // ============================================================
 // 構造体定義
 // ============================================================
@@ -46,10 +54,14 @@ struct RenderMesh {
     std::string beforeSlotInfo;
     std::vector<std::pair<int, int>> suggestions;
 
-    // ★★★ 修正箇所: string ではなく MatchReason に戻す ★★★
+    // ★ デバッグ理由・補助情報
     std::vector<MatchReason> debugReasons;
 
     int shapeIndex = -1;
+
+    // 追加: メッシュ中心とバウンディング半径（カメラリセット用）
+    glm::vec3 center = glm::vec3(0.0f);
+    float boundingRadius = 1.0f;
 
     RenderMesh() = default;
 
@@ -89,6 +101,9 @@ struct RenderMesh {
             suggestions = std::move(other.suggestions);
             debugReasons = std::move(other.debugReasons); // ここも MatchReason型として移動されます
             shapeIndex = other.shapeIndex;
+            // 追加フィールドのムーブ
+            center = other.center;
+            boundingRadius = other.boundingRadius;
         }
         return *this;
     }
@@ -115,7 +130,14 @@ struct SlotRecord {
     std::string displayText;
     bool isOspSource = false;
     std::string originalNifPath;
+    // 新: セッション保存／ワーカー用フラグ
+    // pendingOnly: NIF は実際に書き換えない（例: NiSkin）が slotdata に反映したいため pending に入れておく
+    // nifModified: 将来用フラグ（NIF が実際に変更されたか）
+    bool pendingOnly = false;
+    bool nifModified = false;
 };
+//slotdata-*.txt のスロット文字列からスロット数を数えるヘルパー関数
+int CountSlotsInString(const std::string& slotStr);
 
 struct KidKeyword {
     std::string keyword;
@@ -233,13 +255,22 @@ extern double g_LastMouseX;
 extern double g_LastMouseY;
 extern bool g_MouseInitialized;
 
+// 新規: カメラ注視モードとターゲットメッシュインデックス
+extern CamFocus g_CamFocus;
+extern int g_CamTargetMeshIndex;
+//settingsで縦のオフセット
+extern float g_RefCamZOffset;
+
 void ShowTooltip(const char* desc);
 std::string FormatSlotStringWithNames(const std::string& slotStr);
-
 // これを他のファイルからも呼べるように宣言
 void UpdateMeshList();
+// 新規: 内部実装を外部からも呼べるよう宣言（統一用）
+void UpdateMeshListInternal(nifly::NifFile& targetNif, std::vector<RenderMesh>& outMeshes, bool isRef);
 //void AddLog(const std::string& message, int logType = 0);
 void AddLog(const std::string& message, LogType logType = LogType::Info);
+// BodySlideフォルダから特定のファイルを探すヘルパー関数
+fs::path FindFileInBodySlide(const std::string& filename);
 // ==========================================
 // ヘルパー関数 (宣言)
 // ==========================================
@@ -250,6 +281,7 @@ std::string FormatSlotStringWithNames(const std::string& rawSlots);
 std::vector<int> ParseSlotString(const std::string& slotStr);
 // シェーダー作成 (OpenGL依存)
 unsigned int CreateShader(const char* vSource, const char* fSource);
+
 
 
 

@@ -3,7 +3,7 @@
 #undef APIENTRY
 #include <windows.h>
 #include <shellapi.h>
-#pragma comment(lib, "Shell32.lib") // プロジェクト設定を触りたくない場合の簡易対応
+#pragma comment(lib, "Shell32.lib") //プロジェクト設定を触りたくない場合の簡易対応
 #endif
 #include "UI_Database.h"
 #include "Globals.h"
@@ -13,6 +13,8 @@
 #include <thread>
 #include <algorithm> // transform用
 #include <set>       // uniqueNifs用
+#include "OSP_Logic.h"
+
 // =========================================================================
 // 外部関数の呼び出し準備
 // (Globals.h で宣言されていますが、明示的に書くことでリンクエラーを防ぎます)
@@ -27,6 +29,9 @@ extern fs::path ConstructSafePath(const std::string& root, const std::string& re
 extern void BatchExportWorker();
 extern void ScanOSPWorker();
 extern void ExportOSPWorker();
+
+// 追加: 遅延読み込み API を UI 側から呼べるように extern 宣言→OSP_Logic.hで置き換え
+//extern void LoadOSPDetails(const std::string& filename);
 
 // =========================================================================
 // NIF Database の実装 (UI描画のみ)
@@ -298,6 +303,8 @@ void RenderDatabase() {
                     // リスト項目の描画
                     if (ImGui::Selectable(name.c_str(), g_SelectedOspName == name)) {
                         g_SelectedOspName = name;
+                        // 遅延読み込み: ユーザーが選択した瞬間に詳細をロードする
+                        LoadOSPDetails(name);
                     }
 
                     // ★追加 2: 右クリックメニュー (BlockedListへの追加)
