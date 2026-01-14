@@ -348,9 +348,7 @@ void RenderDatabase() {
                 for (const auto& [n, o] : g_OspFiles) for (const auto& s : o.sets) if (s.selected) selCount++;
                 std::string btnText = "Export Checked Sources (" + std::to_string(selCount) + ")";
 
-                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.0f, 0.7f, 0.0f, 1.0f));
-                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.1f, 0.85f, 0.1f, 1.0f));
-                ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.0f, 0.55f, 0.0f, 1.0f));
+                
 
                 if (selCount > 0) {
                     // ★ OSP_Logic のワーカーを呼び出す
@@ -364,7 +362,7 @@ void RenderDatabase() {
                     ImGui::EndDisabled();
                 }
 
-                ImGui::PopStyleColor(3);
+                
                 ShowTooltip("Exports Checked source NIFs with slots applied from Database.");
 
                 ImGui::EndTabItem();

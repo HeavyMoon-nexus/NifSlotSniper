@@ -1535,8 +1535,11 @@ int main(int, char**) {
             }
             // 各ウィンドウの表示切替
             if (ImGui::MenuItem("Auto-Fix Rules")) g_ShowRulesWindow = true;//true
-                if (ImGui::MenuItem("Analysis Details")) g_ShowAnalysisDetailsLog = true;//true
-            ImGui::EndMainMenuBar();
+            if (ImGui::MenuItem("Analysis Details")) g_ShowAnalysisDetailsLog = true;//true
+            //ImGui::EndMenu();
+            if (ImGui::MenuItem("KID Generator")) g_ShowKIDGeneratorWindow = true;
+            
+        ImGui::EndMainMenuBar();
         }
 
         if (g_RequestInitialSetup) {
@@ -1591,6 +1594,8 @@ int main(int, char**) {
         RenderDatabase();
 
         // 6. KID Generator
+        //RenderKidGenerator();
+
         RenderKidGenerator();
 
 		// 7. デバッグログウィンドウ
