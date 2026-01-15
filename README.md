@@ -1,3 +1,4 @@
+This tool is released under the MIT License. See the License section below for details.
 This tool makes it easy to change and bulk sync armor slots between nif and esp.
 You can also change the slot of the original nif for Bodyslide.
 
