@@ -34,13 +34,17 @@ void RenderPendingArea() {
         ImGui::TextColored(ImVec4(1, 0.5f, 0, 1), "Pending: %d", (int)g_SessionChanges.size());
 
         // 保存ボタン
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.0f, 0.7f, 0.0f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.1f, 0.85f, 0.1f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.0f, 0.55f, 0.0f, 1.0f));
         if (ImGui::Button("Save TXT & Export NIFs", ImVec2(-1, 30))) {
             std::thread(SaveAndExportAllWorker).detach();
         }
+        ImGui::PopStyleColor(3);
+
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip("Saves slotdata-output.txt AND exports all pending NIFs.\nOSP-derived files will go to ShapeData, others to meshes.");
         }
-
         // リスト表示
         if (ImGui::BeginChild("Stack", ImVec2(0, 0), true)) {
             for (auto it = g_SessionChanges.begin(); it != g_SessionChanges.end(); ) {

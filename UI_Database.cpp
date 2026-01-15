@@ -3,7 +3,7 @@
 #undef APIENTRY
 #include <windows.h>
 #include <shellapi.h>
-#pragma comment(lib, "Shell32.lib") // プロジェクト設定を触りたくない場合の簡易対応
+#pragma comment(lib, "Shell32.lib") //プロジェクト設定を触りたくない場合の簡易対応
 #endif
 #include "UI_Database.h"
 #include "Globals.h"
@@ -13,6 +13,8 @@
 #include <thread>
 #include <algorithm> // transform用
 #include <set>       // uniqueNifs用
+#include "OSP_Logic.h"
+
 // =========================================================================
 // 外部関数の呼び出し準備
 // (Globals.h で宣言されていますが、明示的に書くことでリンクエラーを防ぎます)
@@ -27,6 +29,9 @@ extern fs::path ConstructSafePath(const std::string& root, const std::string& re
 extern void BatchExportWorker();
 extern void ScanOSPWorker();
 extern void ExportOSPWorker();
+
+// 追加: 遅延読み込み API を UI 側から呼べるように extern 宣言→OSP_Logic.hで置き換え
+//extern void LoadOSPDetails(const std::string& filename);
 
 // =========================================================================
 // NIF Database の実装 (UI描画のみ)
@@ -298,6 +303,8 @@ void RenderDatabase() {
                     // リスト項目の描画
                     if (ImGui::Selectable(name.c_str(), g_SelectedOspName == name)) {
                         g_SelectedOspName = name;
+                        // 遅延読み込み: ユーザーが選択した瞬間に詳細をロードする
+                        LoadOSPDetails(name);
                     }
 
                     // ★追加 2: 右クリックメニュー (BlockedListへの追加)
@@ -341,9 +348,7 @@ void RenderDatabase() {
                 for (const auto& [n, o] : g_OspFiles) for (const auto& s : o.sets) if (s.selected) selCount++;
                 std::string btnText = "Export Checked Sources (" + std::to_string(selCount) + ")";
 
-                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.0f, 0.7f, 0.0f, 1.0f));
-                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.1f, 0.85f, 0.1f, 1.0f));
-                ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.0f, 0.55f, 0.0f, 1.0f));
+                
 
                 if (selCount > 0) {
                     // ★ OSP_Logic のワーカーを呼び出す
@@ -357,7 +362,7 @@ void RenderDatabase() {
                     ImGui::EndDisabled();
                 }
 
-                ImGui::PopStyleColor(3);
+                
                 ShowTooltip("Exports Checked source NIFs with slots applied from Database.");
 
                 ImGui::EndTabItem();

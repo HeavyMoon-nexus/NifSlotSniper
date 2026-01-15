@@ -44,12 +44,14 @@ static std::vector<std::string> ParseTargetBuffer(const char* buffer) {
 // KID Generator の実装
 // =========================================================================
 void RenderKidGenerator() {
+    if (!g_ShowKIDGeneratorWindow) return;
     // 表示位置・サイズ設定
     ImGui::SetNextWindowPos(ImVec2(780, 270), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(400, 450), ImGuiCond_FirstUseEver);
 
+
     // ウィンドウ開始
-    if (ImGui::Begin("KID Generator")) {
+    if (ImGui::Begin("KID Generator", &g_ShowKIDGeneratorWindow)) {
 
         // ★ NIF内の全メッシュのスロットを統合して取得
         std::set<int> distinctSlots;

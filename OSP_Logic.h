@@ -1,17 +1,18 @@
 #pragma once
-#include "Globals.h" // 構造体定義 (BodySlideSet, OSPFile) を参照するため
+#include "Globals.h" // 型定義 (BodySlideSet, OSPFile) を利用
 
-// ヘルパー関数
+// プロトタイプ
 std::string NormalizePath(const std::string& path);
 
-// OSPファイルの解析
+// OSP 解析（実際のパース処理）
 void ParseOSPFile(const fs::path& ospPath, std::vector<BodySlideSet>& outSets);
 
-// ワーカー関数 (スレッドで実行される処理)
+// スキャン / エクスポート ワーカー群
 void ScanOSPWorker();
 void ExportOSPWorker();
-//void ExecuteSourceNifExport();
 void ScanBodySlideWorker();
 void ScanBodySlideOSPs();
-void ParseOSPFile();
-//void ExportBodySlideWorker();
+
+// 新規: 遅延読み込み用 API
+void LoadOSPDetails(const std::string& filename);
+
