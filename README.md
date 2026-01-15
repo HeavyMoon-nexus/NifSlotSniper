@@ -240,5 +240,5 @@ The full text of each license can be found in the following files:
 
 - `LICENSE` — MIT License for Nif Slot Sniper
 - `THIRD_PARTY_LICENSES.md` — Third-party license notices
-- `Apache-License 2.0.txt` — Full text of the Apache License 2.0
+- `Apache-2.0.txt` — Full text of the Apache License 2.0
 - http://www.apache.org/licenses/LICENSE-2.0
