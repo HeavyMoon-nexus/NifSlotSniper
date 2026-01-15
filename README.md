@@ -209,7 +209,35 @@ NIF Databaseで右クリック -> Add ESPs to BlockedListでSource BlockedList�
 Control Panel内Mesh Listでも右クリックするとMeshes BlockedListに入り、グレーアウトする。Auto-fixのAnalyze対象から外すことが出来る(CollisionBodyなどの不要なboneを取得しない)
 File -> Settingsウィンドウのタブから追加及び削除が可能。
 
-
 /////Future
 ・Textureの読み込み機能
 ・複数のnifをrefとして読み込む機能
+
+
+## License
+
+Nif Slot Sniper is licensed under the MIT License.
+
+Copyright (c) 2026 HeavyMoon
+
+You are free to use, modify, and distribute this software, including for commercial purposes,
+as long as the original copyright notice and license text are included.
+
+### Third-Party Licenses
+
+This project includes third-party libraries that are distributed under their own licenses:
+
+- Nifly (MIT License)
+- Dear ImGui (MIT License)
+- GLFW (zlib/libpng License)
+- GLAD (MIT License)
+- OpenGL Mathematics (GLM) (MIT License)
+- TinyXML (zlib License)
+- Khronos OpenGL / OpenGL ES headers (Apache License 2.0)
+
+The full text of each license can be found in the following files:
+
+- `LICENSE` — MIT License for Nif Slot Sniper
+- `THIRD_PARTY_LICENSES.md` — Third-party license notices
+- `Apache-License 2.0.txt` — Full text of the Apache License 2.0
+- http://www.apache.org/licenses/LICENSE-2.0
