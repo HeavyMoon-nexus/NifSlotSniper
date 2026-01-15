@@ -36,9 +36,8 @@ Mo2[This tool is designed to run on ModOrganizer2.]
     linkStyle default stroke-width:2px,fill:none,stroke:#333
 ```
 
-////////////////////////////////////////////////////////////
-/////             NIF SLOT SNIPER 1.0.0                /////
-////////////////////////////////////////////////////////////
+
+NIF SLOT SNIPER 1.0.0
 
 このNIF SLOT SNIPERというツールは、skyrim SE/AE用に、.esp,.nifのスロットを変更するためのものです。
 slotdata-export.txtとslotdata-output.txtのデータを使います。
@@ -46,20 +45,18 @@ Mod Organizer2での使用を前提としています。
 
 
 
-////////////////////////////////////////////////////////////
-/////                  How to use                      /////
-////////////////////////////////////////////////////////////
+How to use
 
 
-============================================================
-=====            Synthesis nifslotEXporter        ==========
-============================================================
+
+=====Synthesis nifslotEXporter
+
 同梱しているSynthesisパッチ。実行すると、espからデータを取り出し、slotdata-export.txtが入手できる(.esp側元スロットデータ)
 Mo2環境なら overwrite\slotdataTXT に出力される。
 
-============================================================
-=====                Nif Slot Sniper              ==========
-============================================================
+
+=====Nif Slot Sniper
+
 1.slotdata-export.txt→slotdata-output.txtの順番で自動的に読み込む。
 
 2.Nif databaseウィンドウに一覧が表示される。
@@ -108,9 +105,9 @@ slotdata-output.txtは、gamedataに設定しているフォルダ以下のslotd
 （フォルダを変更している場合は、slotIMporterのtxt読み込み先をSynthesis内User settingsから修正してください。）
 nifslotIMporterに続く。
 
-============================================================
-=====            Synthesis nifslotIMporter        ==========
-============================================================
+
+=====Synthesis nifslotIMporter
+
 同梱しているSynthesisパッチ。実行すると、espにスロットデータを上書きし、.nif-.esp間でのスロット同期が完了する。
 。
 User settingsで選択したフォルダに出力される。
@@ -135,7 +132,7 @@ exeと同じフォルダ
 ・*_KID.ini - 設定したフォルダに出力されます。espごとに出力されます。既に存在する場合は追記します。
 
 
-////////////////////////////////////////////////////////////
+//////////////////////////
 ★スロット解析機能 (Analyze Slots) について
 Nif Slot Sniperのメイン機能はnifのスロット変更であるが、slotdata-*.txtにより一括変更が可能になっている。
 しかしsynthesisで作成したslotdata-export.txtは基本的にバニラのスロットデータであると想定すると、NifSlotSniperなどで一つづつ設定するいつようが出てくる。
@@ -173,7 +170,7 @@ COMBO Rules > Name Rules > Bone Rules
 の順で設定値を指定すると良いだろう。
 この設定は、画面左上のAuto-Fix Rulesから設定できる。
 
-////////////////////////////////////////////////////////////
+///////////////////////
 ★slotniper-*.txtの形式
 SourceFile;ARMAFormID;ARMAEditorID;ARMOFormID;ARMOEditorID;MalePath;FemalePath;ARMOSlotNumber;ARMASlotNumber
 SourceFile      :espの名前。
@@ -186,9 +183,9 @@ FemalePath      :アーマーアドオンで女性用メッシュに指定され
 ARMOSlotNumber  :**アーマー**のslot番号
 ARMASlotNumber  :**アーマーアドオン**のslot番号
 
-////////////////////////////////////////////////////////////
+////////////////////
 
-********************** KID Generator ***********************
+*******KID Generator
 Keyword Item Distributorの_KID.iniを作成することができる。
 
 @@@@@ How to use @@@@@
@@ -205,13 +202,12 @@ slotとnameが両方ヒットした場合、**がkeywordの左に表示される
 
 このツール自体が服装のnif向けに作っているため、TypeはArmorで固定している。
 
-**********************  Blocked list ***********************
+*******Blocked list
 NIF Databaseで右クリック -> Add ESPs to BlockedListでSource BlockedListに入り、非表示・出力不可にできる。
 Control Panel内Mesh Listでも右クリックするとMeshes BlockedListに入り、グレーアウトする。Auto-fixのAnalyze対象から外すことが出来る(CollisionBodyなどの不要なboneを取得しない)
 File -> Settingsウィンドウのタブから追加及び削除が可能。
 
-////////////////////////////////////////////////////////////
-/////                    Future                        /////
-////////////////////////////////////////////////////////////
+
+/////Future
 ・Textureの読み込み機能
 ・複数のnifをrefとして読み込む機能
