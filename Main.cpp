@@ -378,7 +378,6 @@ void LoadUnifiedConfig() {
 }
 
 extern void SaveUnifiedConfig() {
-    // 1. INI設定を保存
     std::ofstream file(CONFIG_FILENAME);
     if (file.is_open()) {
         file << "[General]\n";
@@ -386,29 +385,28 @@ extern void SaveUnifiedConfig() {
         file << "GameDataPath=" << g_GameDataPath << "\n";
         file << "SynthesisPath=" << g_SynthesisPath << "\n";
         file << "SlotDataPath=" << g_SlotDataPath << "\n";
-        file << "Gender=" << g_TargetGender << "\n\n";
+        file << "Gender=" << g_TargetGender << "\n";
+        file << "RefCamZOffset=" << g_RefCamZOffset << "\n\n";
 
         file << "[Slots]\n";
-        for (const auto& pair : SlotDictionary::slotMap) file << pair.first << "=" << pair.second << "\n";
-
-        // ★削除: [Keywords] セクションの書き込みを削除
-        /*
-        file << "\n[Keywords]\n";
-        for (const auto& k : g_KeywordList) { ... }
-        */
+        for (const auto& pair : SlotDictionary::slotMap) {
+            file << pair.first << "=" << pair.second << "\n";
+        }
 
         file << "\n[BlockedList]\n";
-        for (const auto& bl : g_SourceBlockedList) file << bl << "\n";
+        for (const auto& bl : g_SourceBlockedList) {
+            file << bl << "\n";
+        }
 
         file << "\n[KwBlockedList]\n";
-        for (const auto& kbl : g_KeywordBlockedList) file << kbl << "\n";
-        file << "RefCamZOffset=" << g_RefCamZOffset << "\n";
+        for (const auto& kbl : g_KeywordBlockedList) {
+            file << kbl << "\n";
+        }
         file << "\n";
 
         AddLog("Unified Config Saved (INI).", LogType::Success);
     }
 
-    // 2. ★追加: JSONへキーワードを保存
     SaveKeywordsJSON();
 }
 
