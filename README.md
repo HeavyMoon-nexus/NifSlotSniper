@@ -131,6 +131,8 @@ exeと同じフォルダ
 ・osp由来の.nifファイル - 設定したフォルダの下にCalienteTools/Bodyslide/ShapeDataフォルダ階層を作り、その下に出力します。
 ・*_KID.ini - 設定したフォルダに出力されます。espごとに出力されます。既に存在する場合は追記します。
 
+overwrite/slotdataTXTフォルダ
+・slotdata-output.txt - このツールで編集したデータが出力されます。[ReloadTXT]でツール内にリロードできます。
 
 //////////////////////////
 ★スロット解析機能 (Analyze Slots) について
