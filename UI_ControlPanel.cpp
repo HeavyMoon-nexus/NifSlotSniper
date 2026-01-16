@@ -497,7 +497,6 @@ void RenderControlPanel() {
 
                         // Normalization helper: trim, lowercase, backslash->slash, remove trailing slash
                         auto normalizePath = [](std::string s) -> std::string {
-                            // trim
                             auto ltrim = [](std::string& str) {
                                 str.erase(str.begin(), std::find_if(str.begin(), str.end(), [](unsigned char ch) { return !std::isspace(ch); }));
                                 };
@@ -505,36 +504,70 @@ void RenderControlPanel() {
                                 str.erase(std::find_if(str.rbegin(), str.rend(), [](unsigned char ch) { return !std::isspace(ch); }).base(), str.end());
                                 };
                             ltrim(s); rtrim(s);
-                            // backslash -> slash
                             std::replace(s.begin(), s.end(), '\\', '/');
-                            // lowercase
                             std::transform(s.begin(), s.end(), s.begin(), ::tolower);
-                            // remove trailing slash
                             while (!s.empty() && (s.back() == '/' || s.back() == '\\')) s.pop_back();
                             return s;
+                            };
+
+                        auto buildTailKey = [](const std::string& normalized, size_t segments) -> std::string {
+                            if (normalized.empty() || segments == 0) return std::string();
+                            std::vector<std::string> parts;
+                            size_t start = 0;
+                            while (start < normalized.size()) {
+                                size_t pos = normalized.find('/', start);
+                                std::string token = (pos == std::string::npos)
+                                    ? normalized.substr(start)
+                                    : normalized.substr(start, pos - start);
+                                if (!token.empty()) parts.push_back(token);
+                                if (pos == std::string::npos) break;
+                                start = pos + 1;
+                            }
+                            if (parts.size() < segments) return std::string();
+                            std::string result;
+                            for (size_t i = parts.size() - segments; i < parts.size(); ++i) {
+                                if (!result.empty()) result += '/';
+                                result += parts[i];
+                            }
+                            return result;
                             };
 
                         // Prepare normalized candidates
                         std::vector<std::string> normCandidates;
                         for (const auto& p : validGamePaths) normCandidates.push_back(normalizePath(p));
 
-                        // Helper: check if candidate ends with record path or filename matches
                         auto matchesRecord = [&](const std::string& candidate, const SlotRecord& rec) -> bool {
                             std::string male = normalizePath(rec.malePath);
                             std::string female = normalizePath(rec.femalePath);
-                            if (!male.empty() && candidate.size() >= male.size() && candidate.find(male, candidate.size() - male.size()) != std::string::npos) return true;
-                            if (!female.empty() && candidate.size() >= female.size() && candidate.find(female, candidate.size() - female.size()) != std::string::npos) return true;
-                            // fallback: compare filenames
-                            std::string candFile = fs::path(candidate).filename().string();
-                            std::transform(candFile.begin(), candFile.end(), candFile.begin(), ::tolower);
-                            std::string maleFile = fs::path(male).filename().string();
-                            std::string femaleFile = fs::path(female).filename().string();
-                            std::transform(maleFile.begin(), maleFile.end(), maleFile.begin(), ::tolower);
-                            std::transform(femaleFile.begin(), femaleFile.end(), femaleFile.begin(), ::tolower);
-                            if (!maleFile.empty() && candFile == maleFile) return true;
-                            if (!femaleFile.empty() && candFile == femaleFile) return true;
-                            return false;
-                            };
+
+                            const std::string candTail3 = buildTailKey(candidate, 3);
+                            const std::string candTail2 = buildTailKey(candidate, 2);
+                            const std::string candTail1 = buildTailKey(candidate, 1);
+
+                            auto matchPath = [&](const std::string& recPath) -> bool {
+                                if (recPath.empty()) return false;
+
+                                if (candidate.size() >= recPath.size() &&
+                                    candidate.compare(candidate.size() - recPath.size(), recPath.size(), recPath) == 0) {
+                                    return true;
+                                }
+
+                                const std::string recTail3 = buildTailKey(recPath, 3);
+                                if (!recTail3.empty() && !candTail3.empty() && candTail3 == recTail3) return true;
+
+                                const std::string recTail2 = buildTailKey(recPath, 2);
+                                if (!recTail2.empty() && !candTail2.empty() && candTail2 == recTail2) return true;
+
+                                if (recTail2.empty() && recTail3.empty()) {
+                                    const std::string recTail1 = buildTailKey(recPath, 1);
+                                    if (!recTail1.empty() && !candTail1.empty() && candTail1 == recTail1) return true;
+                                }
+
+                                return false;
+                                };
+
+                            return matchPath(male) || matchPath(female);
+                        };
 
                         int registered = 0;
                         {

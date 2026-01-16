@@ -7,6 +7,7 @@
 #include <iostream>
 #include <fstream>
 #include <sstream>
+#include <numeric>
 
 // ルール構造体
 struct SlotRule {
@@ -23,6 +24,7 @@ struct SlotComboRule {
     bool enabled = true;
     std::string description; // デバッグ・ログ用
 };
+
 struct MatchReason {
     std::string type;    // "NAME", "BONE", "COMBO"
     std::string match;   // マッチしたキーワードやボーン名
@@ -35,11 +37,12 @@ struct DetailedAnalysis {
     std::vector<MatchReason> reasons;          // 判定根拠のリスト
 };
 
+inline DetailedAnalysis result;
 
 class SlotDictionary {
 public:
     static DetailedAnalysis AnalyzeDetailed(const std::vector<std::string>& boneList, const std::string& meshName, const std::string& editorID) {
-        DetailedAnalysis result;
+        //DetailedAnalysis result;
         std::map<int, int> scores;
         std::string meshLower = ToLower(meshName);
         std::string eidLower = ToLower(editorID);
@@ -69,14 +72,24 @@ public:
         for (const auto& rule : comboRules) {
             if (!rule.enabled) continue;
             bool allMatch = true;
+            std::vector<std::string> matchedKeywords;
+
             for (const auto& kw : rule.requiredKeywords) {
-                bool found = false;
-                for (const auto& b : boneList) { if (Contains(b, kw)) { found = true; break; } }
-                if (!found) { allMatch = false; break; }
+                if (ComboKeywordMatches(kw, boneList, meshLower, eidLower)) {
+                    matchedKeywords.push_back(kw);
+                    continue;
+                }
+                allMatch = false;
+                break;
             }
+
             if (allMatch) {
                 scores[rule.slotID] += rule.bonusScore;
-                result.reasons.push_back({ "COMBO", "All keywords match", rule.slotID, rule.bonusScore });
+                result.reasons.push_back({ "COMBO",
+                    matchedKeywords.empty() ? "All keywords match" : ("Match: " + std::accumulate(
+                        std::next(matchedKeywords.begin()), matchedKeywords.end(), matchedKeywords.front(),
+                        [](std::string acc, const std::string& s) { return acc + ", " + s; })),
+                    rule.slotID, rule.bonusScore });
             }
         }
 
@@ -232,21 +245,25 @@ public:
         // ★追加: コンビネーションルールの判定
         for (const auto& rule : comboRules) {
             if (!rule.enabled) continue;
-
             bool allMatch = true;
+            std::vector<std::string> matchedKeywords;
+
             for (const auto& kw : rule.requiredKeywords) {
-                bool found = false;
-                for (const auto& bone : boneList) {
-                    if (Contains(bone, kw)) {
-                        found = true;
-                        break;
-                    }
+                if (ComboKeywordMatches(kw, boneList, meshLower, eidLower)) {
+                    matchedKeywords.push_back(kw);
+                    continue;
                 }
-                if (!found) { allMatch = false; break; }
+                allMatch = false;
+                break;
             }
 
             if (allMatch) {
                 scores[rule.slotID] += rule.bonusScore;
+                result.reasons.push_back({ "COMBO",
+                    matchedKeywords.empty() ? "All keywords match" : ("Match: " + std::accumulate(
+                        std::next(matchedKeywords.begin()), matchedKeywords.end(), matchedKeywords.front(),
+                        [](std::string acc, const std::string& s) { return acc + ", " + s; })),
+                    rule.slotID, rule.bonusScore });
             }
         }
         // スコア順にソートして上位3つを返す
@@ -290,6 +307,37 @@ private:
         std::string t = ToLower(target);
         std::string k = ToLower(key);
         return t.find(k) != std::string::npos;
+    }
+    static bool HasBoneKeyword(const std::vector<std::string>& bones, const std::string& keyword) {
+        for (const auto& bone : bones) {
+            if (Contains(bone, keyword)) return true;
+        }
+        return false;
+    }
+    static bool ComboKeywordMatches(const std::string& rawKeyword,
+        const std::vector<std::string>& bones,
+        const std::string& meshLower,
+        const std::string& eidLower) {
+
+        auto trim = [](std::string s) {
+            auto isSpace = [](unsigned char c) { return std::isspace(c); };
+            s.erase(s.begin(), std::find_if(s.begin(), s.end(), [&](unsigned char c) { return !isSpace(c); }));
+            s.erase(std::find_if(s.rbegin(), s.rend(), [&](unsigned char c) { return !isSpace(c); }).base(), s.end());
+            return s;
+            };
+
+        std::string keyword = ToLower(trim(rawKeyword));
+        if (keyword.empty()) return false;
+
+        auto matchesBone = [&](const std::string& k) { return HasBoneKeyword(bones, k); };
+        auto matchesMesh = [&](const std::string& k) { return Contains(meshLower, k) || Contains(eidLower, k); };
+
+        if (keyword.rfind("bone:", 0) == 0)  return matchesBone(keyword.substr(5));
+        if (keyword.rfind("mesh:", 0) == 0)  return matchesMesh(keyword.substr(5));
+        if (keyword.rfind("name:", 0) == 0)  return matchesMesh(keyword.substr(5));
+
+        // デフォルト: ボーン → メッシュ名/EditorID の順で判定
+        return matchesBone(keyword) || matchesMesh(keyword);
     }
     static std::vector<std::string> Split(const std::string& s, char delimiter) {
         std::vector<std::string> tokens;
