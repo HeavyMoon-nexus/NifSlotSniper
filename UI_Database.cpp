@@ -15,6 +15,7 @@
 #include <set>       // uniqueNifs用
 #include <unordered_map>　// RecordSelectionMap用
 #include "OSP_Logic.h"
+#include <sstream>
 
 // =========================================================================
 // 外部関数の呼び出し準備
@@ -77,8 +78,8 @@ void RenderDatabase() {
 
                 ImGui::Separator();
                 g_SlotFilter.Draw("Filter");
-                ShowTooltip("You can search for esp name, slot number, mesh name.\nYou may find unexpected hits.");
-				ImGui::Text("Don't rely on it completely,\nuse the checkboxes at your own risk.");
+                ShowTooltip("search for esp name, slot number, mesh name, etc.\nYou may find unexpected hits.");
+				ImGui::Text("prefix esp:,slot:,mesh:=\nexample esp:mymod,slot:49,mesh:skirt,long\nDon't rely on it completely.");
 				ImGui::Separator();
 
                 // --- 選択ボタン群 ---
@@ -162,52 +163,146 @@ void RenderDatabase() {
                     }
                     };
 
+                // -----------------------------------------------------------------------------
+                // 高度な検索フィルターロジック (AND検索 & プレフィックス対応)
+                // -----------------------------------------------------------------------------
                 std::unordered_map<int, SlotRecord*> recordLookup;
                 recordLookup.reserve(g_AllRecords.size());
                 for (auto& rec : g_AllRecords) recordLookup[rec.id] = &rec;
 
-                const auto MatchesValue = [&](const std::string& value) {
-                    return g_SlotFilter.IsActive() && !value.empty() && g_SlotFilter.PassFilter(value.c_str());
+                // 検索トークンの定義
+                struct SearchToken {
+                    enum Type { Generic, Esp, Slot, Mesh } type;
+                    std::string value;
+                };
+
+                // 大文字小文字を無視して含まれているか確認するヘルパー
+                auto StringContains = [](const std::string& haystack, const std::string& needle) -> bool {
+                    if (needle.empty()) return true;
+                    if (haystack.empty()) return false;
+                    auto it = std::search(
+                        haystack.begin(), haystack.end(),
+                        needle.begin(), needle.end(),
+                        [](char ch1, char ch2) { return std::toupper(ch1) == std::toupper(ch2); }
+                    );
+                    return (it != haystack.end());
                     };
-                const auto MatchesPath = [&](const std::string& value) {
-                    if (!g_SlotFilter.IsActive() || value.empty()) return false;
-                    if (g_SlotFilter.PassFilter(value.c_str())) return true;
-                    std::string fileOnly = std::filesystem::path(value).filename().string();
-                    return !fileOnly.empty() && g_SlotFilter.PassFilter(fileOnly.c_str());
-                    };
-                const auto RecordMatchesFilter = [&](int recId) {
-                    if (!g_SlotFilter.IsActive()) return true;
+
+                // 入力文字列をトークンに分解する (例: "iron esp:Dawnguard" -> [Generic:iron, Esp:Dawnguard])
+                auto ParseSearchTokens = [&](const char* input) -> std::vector<SearchToken> {
+                    std::vector<SearchToken> tokens;
+                    std::string text = input;
+                    std::string item;
+                    std::stringstream ss(text);
+
+                    // ★変更: 区切りを ',' に指定
+                    while (std::getline(ss, item, ',')) {
+                        // 前後の空白を除去 (トリミング)
+                        const size_t first = item.find_first_not_of(" \t");
+                        if (first == std::string::npos) continue; // 空白のみならスキップ
+                        const size_t last = item.find_last_not_of(" \t");
+                        item = item.substr(first, (last - first + 1));
+
+                        if (item.empty()) continue;
+
+                        SearchToken token;
+                        if (item.rfind("esp:", 0) == 0 && item.size() > 4) {
+                            token.type = SearchToken::Esp;
+                            token.value = item.substr(4);
+                        }
+                        else if (item.rfind("slot:", 0) == 0 && item.size() > 5) {
+                            token.type = SearchToken::Slot;
+                            token.value = item.substr(5);
+                        }
+                        else if (item.rfind("mesh:", 0) == 0 && item.size() > 5) {
+                            token.type = SearchToken::Mesh;
+                            token.value = item.substr(5);
+                        }
+                        else {
+                            token.type = SearchToken::Generic;
+                            token.value = item;
+                        }
+                        tokens.push_back(token);
+                    }
+                    return tokens;
+                };
+
+                // 現在のフィルター入力を解析
+                // ImGuiTextFilterの内部バッファを直接参照
+                std::vector<SearchToken> currentTokens = ParseSearchTokens(g_SlotFilter.InputBuf);
+                bool isFilterActive = !currentTokens.empty();
+
+                // レコード単体の判定 (すべてのトークンにマッチする必要がある = AND検索)
+                const auto RecordMatchesFilter = [&](int recId) -> bool {
+                    if (!isFilterActive) return true;
+
                     auto it = recordLookup.find(recId);
                     if (it == recordLookup.end()) return false;
                     const auto& rec = *it->second;
-                    if (MatchesValue(rec.displayText))  return true;
-                    if (MatchesValue(rec.sourceFile))   return true;
-                    if (MatchesValue(rec.armaEditorID)) return true;
-                    if (MatchesValue(rec.armoEditorID)) return true;
-                    if (MatchesValue(rec.armaSlots))    return true;
-                    if (MatchesValue(rec.armoSlots))    return true;
-                    if (MatchesPath(rec.nifPath))       return true;
-                    if (MatchesPath(rec.malePath))      return true;
-                    if (MatchesPath(rec.femalePath))    return true;
-                    return false;
+
+                    for (const auto& token : currentTokens) {
+                        bool tokenMatch = false;
+
+                        // ファイル名のみ抽出用
+                        auto GetFileName = [](const std::string& p) { return fs::path(p).filename().string(); };
+
+                        switch (token.type) {
+                        case SearchToken::Esp:
+                            // esp: 指定時はソースファイル名のみ検索
+                            if (StringContains(rec.sourceFile, token.value)) tokenMatch = true;
+                            break;
+
+                        case SearchToken::Slot:
+                            // slot: 指定時はスロット番号文字列のみ検索
+                            if (StringContains(rec.armaSlots, token.value)) tokenMatch = true;
+                            else if (StringContains(rec.armoSlots, token.value)) tokenMatch = true;
+                            break;
+
+                        case SearchToken::Mesh:
+                            // mesh: 指定時はNIFパス(およびファイル名)を検索
+                            if (StringContains(rec.nifPath, token.value)) tokenMatch = true;
+                            else if (StringContains(rec.malePath, token.value)) tokenMatch = true;
+                            else if (StringContains(rec.femalePath, token.value)) tokenMatch = true;
+                            // パスが長い場合、ファイル名だけでもヒットするようにする
+                            else if (StringContains(GetFileName(rec.nifPath), token.value)) tokenMatch = true;
+                            break;
+
+                        case SearchToken::Generic:
+                            // 指定なし: すべてのフィールドを横断検索
+                            if (StringContains(rec.displayText, token.value))  tokenMatch = true;
+                            else if (StringContains(rec.sourceFile, token.value))   tokenMatch = true;
+                            else if (StringContains(rec.armaEditorID, token.value)) tokenMatch = true;
+                            else if (StringContains(rec.armoEditorID, token.value)) tokenMatch = true;
+                            else if (StringContains(rec.armaSlots, token.value))    tokenMatch = true;
+                            else if (StringContains(rec.armoSlots, token.value))    tokenMatch = true;
+                            else if (StringContains(rec.nifPath, token.value))      tokenMatch = true;
+                            else if (StringContains(GetFileName(rec.nifPath), token.value)) tokenMatch = true;
+                            break;
+                        }
+
+                        // 一つでもマッチしないトークンがあれば、そのレコードは除外 (AND動作)
+                        if (!tokenMatch) return false;
+                    }
+                    return true;
                     };
+
+                // 以下、ツリー構造用の判定ロジック (変更なしだが RecordMatchesFilter に依存)
                 const auto NifHasMatches = [&](const std::string& nifName, const std::vector<int>& ids) {
-                    if (!g_SlotFilter.IsActive()) return true;
-                    if (g_SlotFilter.PassFilter(nifName.c_str())) return true;
+                    if (!isFilterActive) return true;
+                    // NIF名自体がトークンのどれかに引っかかる場合も表示許可したいが、
+                    // 厳密なAND検索を行うため、基本は「子のIDが一つでもフィルタを通るか」で判定する
                     for (int id : ids) if (RecordMatchesFilter(id)) return true;
                     return false;
                     };
                 const auto GenderHasMatches = [&](const std::string& genderName, const std::map<std::string, std::vector<int>>& nifMap) {
-                    if (!g_SlotFilter.IsActive()) return true;
-                    if (g_SlotFilter.PassFilter(genderName.c_str())) return true;
+                    if (!isFilterActive) return true;
                     for (const auto& [nifName, ids] : nifMap) {
                         if (NifHasMatches(nifName, ids)) return true;
                     }
                     return false;
                     };
                 const auto SourceHasMatches = [&](const std::string& espName, const std::map<std::string, std::map<std::string, std::vector<int>>>& genderMap) {
-                    if (!g_SlotFilter.IsActive()) return true;
-                    if (g_SlotFilter.PassFilter(espName.c_str())) return true;
+                    if (!isFilterActive) return true;
                     for (const auto& [genderName, nifMap] : genderMap) {
                         if (GenderHasMatches(genderName, nifMap)) return true;
                     }
@@ -343,6 +438,75 @@ void RenderDatabase() {
                 ImGui::SameLine();
                 static ImGuiTextFilter ospFilter;
                 ospFilter.Draw("Filter OSP");
+                ShowTooltip("search for mesh name, etc.\nYou may find unexpected hits.");
+                ImGui::Text("prefix m:=mesh");
+
+                // ※ SlotList側と同じヘルパー関数を再定義 (スコープが異なるため)
+                struct SearchToken { enum Type { Generic, Mesh } type; std::string value; };
+
+                auto StringContains = [](const std::string& haystack, const std::string& needle) {
+                    if (needle.empty()) return true;
+                    if (haystack.empty()) return false;
+                    auto it = std::search(haystack.begin(), haystack.end(), needle.begin(), needle.end(),
+                        [](char c1, char c2) { return std::toupper(c1) == std::toupper(c2); });
+                    return (it != haystack.end());
+                    };
+
+                auto ParseOspTokens = [&](const char* input) {
+                    std::vector<SearchToken> tokens;
+                    std::string text = input;
+                    std::string item;
+                    std::stringstream ss(text);
+
+                    // ★変更: 区切りを ',' に指定
+                    while (std::getline(ss, item, ',')) {
+                        // 前後の空白を除去 (トリミング)
+                        const size_t first = item.find_first_not_of(" \t");
+                        if (first == std::string::npos) continue;
+                        const size_t last = item.find_last_not_of(" \t");
+                        item = item.substr(first, (last - first + 1));
+
+                        if (item.empty()) continue;
+
+                        SearchToken token;
+                        if (item.rfind("mesh:", 0) == 0 && item.size() > 5) {
+                            token.type = SearchToken::Mesh;
+                            token.value = item.substr(5);
+                        }
+                        else {
+                            token.type = SearchToken::Generic;
+                            token.value = item;
+                        }
+                        tokens.push_back(token);
+                    }
+                    return tokens;
+                };
+
+                std::vector<SearchToken> ospTokens = ParseOspTokens(ospFilter.InputBuf);
+                bool isOspFilterActive = !ospTokens.empty();
+
+                const auto OspMatches = [&](const std::string& ospName, const OSPFile& data) {
+                    if (!isOspFilterActive) return true;
+
+                    for (const auto& token : ospTokens) {
+                        bool tokenMatch = false;
+                        if (token.type == SearchToken::Generic) {
+                            // ファイル名を検索
+                            if (StringContains(ospName, token.value)) tokenMatch = true;
+                            // 通常検索でも中身(meshパス)を検索対象にするなら以下を有効化
+                            // else { for(const auto& s : data.sets) if(StringContains(s.sourceNifPath, token.value)) { tokenMatch=true; break; } }
+                        }
+                        else if (token.type == SearchToken::Mesh) {
+                            // mesh: 指定時は中身のパスやOutput名を検索
+                            for (const auto& s : data.sets) {
+                                if (StringContains(s.sourceNifPath, token.value)) { tokenMatch = true; break; }
+                                if (StringContains(s.outputName, token.value)) { tokenMatch = true; break; }
+                            }
+                        }
+                        if (!tokenMatch) return false; // AND条件不一致
+                    }
+                    return true;
+                 };
 
                 // Columns
                 float footerH = ImGui::GetFrameHeightWithSpacing() + 10;
@@ -350,8 +514,9 @@ void RenderDatabase() {
 
                 ImGui::BeginChild("OspList", ImVec2(0, -footerH), true);
                 for (const auto& [name, ospData] : g_OspFiles) {
-                    if (!ospFilter.PassFilter(name.c_str())) continue;
-                    // ★追加 1: ブロックリストに含まれているかチェックして、あればスキップ
+                    //if (!ospFilter.PassFilter(name.c_str())) continue;
+                    if (!OspMatches(name, ospData)) continue;
+                    // ブロックリストに含まれているかチェックして、あればスキップ
                     bool isBlocked = false;
                     for (const auto& bl : g_SourceBlockedList) {
                         if (name == bl) {
@@ -434,4 +599,4 @@ void RenderDatabase() {
 
     } // End Begin
     ImGui::End();
-}//UI_database.cpp_backup
+}
