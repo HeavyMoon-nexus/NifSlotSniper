@@ -44,7 +44,7 @@ void RenderRulesWindow() {
 
                 // 2. ヒントテキストをモードによって変える
                 const char* hintText = "Search word (e.g. skirt)";
-                if (newType == 2) hintText = "Combo words (e.g. L Foot,R Foot)";
+                if (newType == 2) hintText = "prefix=bone:,mesh:,name:";
 
                 ImGui::SameLine();
                 ImGui::SetNextItemWidth(200);

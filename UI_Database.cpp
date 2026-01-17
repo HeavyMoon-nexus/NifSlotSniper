@@ -13,6 +13,7 @@
 #include <thread>
 #include <algorithm> // transform用
 #include <set>       // uniqueNifs用
+#include <unordered_map>　// RecordSelectionMap用
 #include "OSP_Logic.h"
 
 // =========================================================================
@@ -76,6 +77,9 @@ void RenderDatabase() {
 
                 ImGui::Separator();
                 g_SlotFilter.Draw("Filter");
+                ShowTooltip("You can search for esp name, slot number, mesh name.\nYou may find unexpected hits.");
+				ImGui::Text("Don't rely on it completely,\nuse the checkboxes at your own risk.");
+				ImGui::Separator();
 
                 // --- 選択ボタン群 ---
                 if (ImGui::Button("Select All")) {
@@ -158,9 +162,64 @@ void RenderDatabase() {
                     }
                     };
 
+                std::unordered_map<int, SlotRecord*> recordLookup;
+                recordLookup.reserve(g_AllRecords.size());
+                for (auto& rec : g_AllRecords) recordLookup[rec.id] = &rec;
+
+                const auto MatchesValue = [&](const std::string& value) {
+                    return g_SlotFilter.IsActive() && !value.empty() && g_SlotFilter.PassFilter(value.c_str());
+                    };
+                const auto MatchesPath = [&](const std::string& value) {
+                    if (!g_SlotFilter.IsActive() || value.empty()) return false;
+                    if (g_SlotFilter.PassFilter(value.c_str())) return true;
+                    std::string fileOnly = std::filesystem::path(value).filename().string();
+                    return !fileOnly.empty() && g_SlotFilter.PassFilter(fileOnly.c_str());
+                    };
+                const auto RecordMatchesFilter = [&](int recId) {
+                    if (!g_SlotFilter.IsActive()) return true;
+                    auto it = recordLookup.find(recId);
+                    if (it == recordLookup.end()) return false;
+                    const auto& rec = *it->second;
+                    if (MatchesValue(rec.displayText))  return true;
+                    if (MatchesValue(rec.sourceFile))   return true;
+                    if (MatchesValue(rec.armaEditorID)) return true;
+                    if (MatchesValue(rec.armoEditorID)) return true;
+                    if (MatchesValue(rec.armaSlots))    return true;
+                    if (MatchesValue(rec.armoSlots))    return true;
+                    if (MatchesPath(rec.nifPath))       return true;
+                    if (MatchesPath(rec.malePath))      return true;
+                    if (MatchesPath(rec.femalePath))    return true;
+                    return false;
+                    };
+                const auto NifHasMatches = [&](const std::string& nifName, const std::vector<int>& ids) {
+                    if (!g_SlotFilter.IsActive()) return true;
+                    if (g_SlotFilter.PassFilter(nifName.c_str())) return true;
+                    for (int id : ids) if (RecordMatchesFilter(id)) return true;
+                    return false;
+                    };
+                const auto GenderHasMatches = [&](const std::string& genderName, const std::map<std::string, std::vector<int>>& nifMap) {
+                    if (!g_SlotFilter.IsActive()) return true;
+                    if (g_SlotFilter.PassFilter(genderName.c_str())) return true;
+                    for (const auto& [nifName, ids] : nifMap) {
+                        if (NifHasMatches(nifName, ids)) return true;
+                    }
+                    return false;
+                    };
+                const auto SourceHasMatches = [&](const std::string& espName, const std::map<std::string, std::map<std::string, std::vector<int>>>& genderMap) {
+                    if (!g_SlotFilter.IsActive()) return true;
+                    if (g_SlotFilter.PassFilter(espName.c_str())) return true;
+                    for (const auto& [genderName, nifMap] : genderMap) {
+                        if (GenderHasMatches(genderName, nifMap)) return true;
+                    }
+                    return false;
+                    };
+                // --- 追加ここまで ---
+
                 // ツリー描画
                 for (auto& [espName, genderMap] : g_DisplayTree) {
-                    if (!g_SlotFilter.PassFilter(espName.c_str())) continue;
+                    // 古い条件: if (!g_SlotFilter.PassFilter(espName.c_str())) continue;
+                    // 新しい条件:
+                    if (!SourceHasMatches(espName, genderMap)) continue;
 
                     bool isBlocked = false;
                     for (const auto& bl : g_SourceBlockedList) if (espName == bl) isBlocked = true;
@@ -191,6 +250,7 @@ void RenderDatabase() {
 
                     if (nodeOpen) {
                         for (auto& [genderName, nifMap] : genderMap) {
+                            if (!GenderHasMatches(genderName, nifMap)) continue;
                             bool allInGen = true;
                             for (auto& [n, ids] : nifMap) for (int id : ids) if (!g_RecordSelectionMap[id]) allInGen = false;
                             bool checkGen = allInGen;
@@ -200,6 +260,7 @@ void RenderDatabase() {
                             ImGui::SameLine();
                             if (ImGui::TreeNode(genderName.c_str())) {
                                 for (auto& [nifName, ids] : nifMap) {
+                                    if (!NifHasMatches(nifName, ids)) continue;
                                     bool allInNif = true;
                                     for (int id : ids) if (!g_RecordSelectionMap[id]) allInNif = false;
                                     bool checkNif = allInNif;
@@ -348,7 +409,7 @@ void RenderDatabase() {
                 for (const auto& [n, o] : g_OspFiles) for (const auto& s : o.sets) if (s.selected) selCount++;
                 std::string btnText = "Export Checked Sources (" + std::to_string(selCount) + ")";
 
-                
+
 
                 if (selCount > 0) {
                     // ★ OSP_Logic のワーカーを呼び出す
@@ -362,7 +423,7 @@ void RenderDatabase() {
                     ImGui::EndDisabled();
                 }
 
-                
+
                 ShowTooltip("Exports Checked source NIFs with slots applied from Database.");
 
                 ImGui::EndTabItem();
@@ -373,4 +434,4 @@ void RenderDatabase() {
 
     } // End Begin
     ImGui::End();
-}
+}//UI_database.cpp_backup
