@@ -13,8 +13,10 @@
 #include <map> 
 #include <cctype> 
 #include <fstream> 
-#include <set> 
+#include <set>
 #include <regex>
+#include <thread>   // ★A2: 終了時のワーカー完了待ち
+#include <chrono>
 
 #include "tinyxml2.h"
 
@@ -70,6 +72,12 @@ const char* KEYWORDS_JSON_FILE = "keywords.json";
 std::vector<std::string> SplitString(const std::string& s, char delimiter);
 std::vector<int> ParseSlotString(const std::string& slotStr);
 
+// ★SEH ラッパーの前方宣言（実体はファイル下部）。定義より前の LoadNifFileCore /
+//   ApplySlotChanges などで使うため、ここで宣言しておく。
+static int SafeNifLoad(nifly::NifFile& nif, const fs::path& p);
+static bool SafeNifSave(nifly::NifFile& nif, const fs::path& p);
+static bool SafeWritePartitions(nifly::BSDismemberSkinInstance* dis, const int* slots, int count);
+
 // ============================================================
 // シェーダー
 // ============================================================
@@ -77,13 +85,24 @@ const char* vertexShaderSource = R"(
 #version 330 core
 layout (location = 0) in vec3 aPos;
 layout (location = 1) in vec3 aNormal;
+layout (location = 2) in vec2 aUV;
+layout (location = 3) in vec4 aTangent; // ★#3: 接線xyz + ハンドネスw（B=cross(N,T)*w）
 uniform mat4 model;
 uniform mat4 view;
 uniform mat4 projection;
 out vec3 Normal;
+out vec3 Tangent;
+out float TanW;
+out vec3 WorldPos;
+out vec2 UV;
 void main() {
     gl_Position = projection * view * model * vec4(aPos, 1.0);
-    Normal = mat3(transpose(inverse(model))) * aNormal; 
+    mat3 nrmMat = mat3(transpose(inverse(model)));
+    Normal = nrmMat * aNormal;
+    Tangent = nrmMat * aTangent.xyz;    // ★#3
+    TanW = aTangent.w;                  // ★#3-fix: 従法線ハンドネス
+    WorldPos = vec3(model * vec4(aPos, 1.0)); // ★#3: スペキュラ用
+    UV = aUV;
 }
 )";
 
@@ -91,16 +110,93 @@ const char* fragmentShaderSource = R"(
 #version 330 core
 out vec4 FragColor;
 in vec3 Normal;
+in vec3 Tangent;
+in float TanW;
+in vec3 WorldPos;
+in vec2 UV;
 uniform vec3 lightDir;
 uniform vec3 objectColor;
+uniform sampler2D diffuseTex;
+uniform sampler2D normalTex;   // ★#3: 法線マップ（slot1）
+uniform int useTexture;  // 0=flat(色), 1=texture
+uniform int useNormal;   // ★#3: 1=法線マップ有効（接線あり & マップ取得済み）
+uniform int nmFlipGreen; // ★#3-debug: 1=グリーン反転（DirectX 規約）
+uniform int nmFlipHand;  // ★#3-debug: 1=ハンドネス反転
+uniform int useAlphaTest;     // ★#3-alpha: 1=アルファテスト discard 有効
+uniform float alphaThreshold; // ★#3-alpha: この値未満の α を discard
+uniform vec3 viewPos;    // ★#3: カメラのワールド座標（スペキュラ用）
+uniform vec3 tint;       // テクスチャモード時の選択ハイライト等
 void main() {
     vec3 norm = normalize(Normal);
-    if (!gl_FrontFacing) norm = -norm; 
+    if (!gl_FrontFacing) norm = -norm;
+
+    float gloss = 0.0;
+    if (useNormal == 1) {
+        // ★#3: 接空間法線をサンプルして摂動。BC5(RG)/BC7(RGB) 両対応のため Z を再構成。
+        vec3 nt = texture(normalTex, UV).rgb;
+        vec2 nxy = nt.xy * 2.0 - 1.0;
+        if (nmFlipGreen == 1) nxy.y = -nxy.y; // ★#3-debug: DirectX 規約
+        float nz = sqrt(clamp(1.0 - dot(nxy, nxy), 0.0, 1.0));
+        vec3 tn = vec3(nxy, nz);
+        // TBN を直交化して構築（Gram-Schmidt）。接線が無い形状では useNormal=0 のためここに来ない。
+        float hand = (nmFlipHand == 1) ? -TanW : TanW; // ★#3-debug: ハンドネス反転
+        vec3 T = normalize(Tangent - norm * dot(norm, Tangent));
+        vec3 B = cross(norm, T) * hand; // ★#3-fix: ミラー UV のハンドネス補正
+        norm = normalize(mat3(T, B, norm) * tn);
+        gloss = texture(normalTex, UV).a; // 法線マップ α の光沢（BC5 は α=1）
+    }
+
     vec3 light = normalize(lightDir);
     float diff = max(dot(norm, light), 0.4);
-    FragColor = vec4(objectColor * diff, 1.0);
+
+    if (useTexture == 1) {
+        vec4 t = texture(diffuseTex, UV);
+        // ★#3-alpha: アルファテスト。閾値未満は捨てる（完全透過部が黒く残るのを防ぐ）。
+        if (useAlphaTest == 1 && t.a < alphaThreshold) discard;
+        vec3 rgb = t.rgb * diff;
+        // ★#3: 簡易 Blinn-Phong 鏡面。診断用途なので控えめに乗せる。
+        if (useNormal == 1) {
+            vec3 V = normalize(viewPos - WorldPos);
+            vec3 H = normalize(light + V);
+            float spec = pow(max(dot(norm, H), 0.0), 32.0) * gloss * 0.22;
+            rgb += vec3(spec);
+        }
+        FragColor = vec4(rgb * tint, t.a); // αで半透明を可視化
+    } else {
+        FragColor = vec4(objectColor * diff, 1.0);
+    }
 }
 )";
+
+// ============================================================
+// ★Viewport FBO: 3D をオフスクリーンに描き、ImGui ウィンドウ内に表示するための
+//   フレームバッファ。これにより 3D が独立したパネルになり、拡縮等の入力を
+//   そのパネルにスコープできる（背景描画＋入力競合だったズーム不能を解消）。
+// ============================================================
+static unsigned int g_ViewFBO = 0, g_ViewColor = 0, g_ViewDepth = 0;
+static int g_ViewW = 0, g_ViewH = 0;
+static int g_PanelW = 800, g_PanelH = 600;   // 3D Viewport パネルの内寸（毎フレーム更新）
+static bool g_ViewportHovered = false;        // マウスが Viewport 上にあるか
+
+static void EnsureViewportFBO(int w, int h) {
+    if (w < 16) w = 16;
+    if (h < 16) h = 16;
+    if (g_ViewFBO && g_ViewW == w && g_ViewH == h) return;
+    if (!g_ViewFBO) glGenFramebuffers(1, &g_ViewFBO);
+    if (!g_ViewColor) glGenTextures(1, &g_ViewColor);
+    if (!g_ViewDepth) glGenRenderbuffers(1, &g_ViewDepth);
+    glBindFramebuffer(GL_FRAMEBUFFER, g_ViewFBO);
+    glBindTexture(GL_TEXTURE_2D, g_ViewColor);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, w, h, 0, GL_RGB, GL_UNSIGNED_BYTE, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_ViewColor, 0);
+    glBindRenderbuffer(GL_RENDERBUFFER, g_ViewDepth);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, w, h);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, g_ViewDepth);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    g_ViewW = w; g_ViewH = h;
+}
 
 
 
@@ -114,7 +210,7 @@ fs::path GetPathFromFolder(const fs::path& fullPath, const std::string& folderNa
     auto it = std::find_if(fullPath.begin(), fullPath.end(), [&](const fs::path& p) {
         // 大文字小文字を無視して比較
         std::string s = p.string();
-        std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+        AsciiLowerInplace(s); // ★B5
         return s == folderName;
         });
 
@@ -159,7 +255,20 @@ fs::path ConstructSafePath(const std::string& rootStr, const std::string& relStr
     }
 
     // 安全に結合 (operator/ が区切り文字を適切に処理します)
-    return root / rel;
+    fs::path full = (root / rel).lexically_normal();
+
+    // ★B3: パストラバーサル検証。rel は外部データ（ARMA WorldModel のモデルパス / .osp 由来）であり、
+    //   "..\..\foo.nif" のような相対指定でルート外へ書込/上書きされ得る。結合結果を正規化し、
+    //   root 配下に収まらなければ拒否（空 path を返す。呼び出し側は空/ロード失敗として安全に継続）。
+    if (!root.empty()) {
+        fs::path rootN = root.lexically_normal();
+        auto mm = std::mismatch(rootN.begin(), rootN.end(), full.begin(), full.end());
+        if (mm.first != rootN.end()) {
+            AddLog("Refusing path outside root (traversal?): rel='" + relStr + "' -> " + full.string(), LogType::Error);
+            return fs::path();
+        }
+    }
+    return full;
 }
 
 std::string GetBaseNifKey(const std::string& path) {
@@ -178,8 +287,8 @@ static std::string NormalizePathForComparison(const std::string& p) {
     if (start == std::string::npos) return std::string();
     size_t end = r.find_last_not_of(" \t\r\n");
     r = r.substr(start, end - start + 1);
-    // 小文字化
-    std::transform(r.begin(), r.end(), r.begin(), [](unsigned char c) { return std::tolower(c); });
+    // 小文字化（★B5: パス比較用キーは ASCII 限定でマルチバイトを保持）
+    AsciiLowerInplace(r);
     // \ を / に統一
     std::replace(r.begin(), r.end(), '\\', '/');
     // 末尾のスラッシュ除去
@@ -190,7 +299,7 @@ static std::string NormalizePathForComparison(const std::string& p) {
 std::string GetRelativeMeshesPath(const fs::path& fullPath) {
     std::string pathStr = fullPath.string();
     std::string lowerPath = pathStr;
-    std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), ::tolower);
+    AsciiLowerInplace(lowerPath); // ★B5
     size_t pos = lowerPath.find("meshes");
     if (pos != std::string::npos) return pathStr.substr(pos);
     return pathStr;
@@ -198,10 +307,60 @@ std::string GetRelativeMeshesPath(const fs::path& fullPath) {
 
 
 // --------------------------------------------------------------------------
+// ★B1/B7: アトミック書込ヘルパー。temp(.tmp) に書く→flush/close→rename で置換する。
+//   書込中のクラッシュ/電源断/ディスクフルでも、置換が成立するまで既存ファイルは無傷
+//   （0 バイト化・途中切れを防ぐ）。同一ボリューム内の rename は概ねアトミック。
+//   戻り値: 成功 true（失敗時は本関数内でログ済み）。
+// --------------------------------------------------------------------------
+static bool AtomicWriteFile(const fs::path& finalP, const std::string& data) {
+    fs::path tmpP = finalP; tmpP += ".tmp";
+    {
+        std::ofstream out(tmpP, std::ios::binary | std::ios::trunc);
+        if (!out) { AddLog("Atomic write: cannot open temp file: " + tmpP.string(), LogType::Error); return false; }
+        out.write(data.data(), (std::streamsize)data.size());
+        out.flush();
+        if (!out) {
+            AddLog("Atomic write: write/flush failed (disk full?): " + tmpP.string(), LogType::Error);
+            out.close(); std::error_code rec; fs::remove(tmpP, rec); return false;
+        }
+    }
+    std::error_code ec;
+    fs::rename(tmpP, finalP, ec); // MSVC は MOVEFILE_REPLACE_EXISTING 相当で既存を置換
+    if (ec) {
+        // フォールバック: 既存を消してから再リネーム（一部環境/ロック対策）。
+        std::error_code ec2; fs::remove(finalP, ec2);
+        ec.clear(); fs::rename(tmpP, finalP, ec);
+        if (ec) {
+            AddLog("Atomic write: rename failed: " + ec.message() + " (" + finalP.string() + ")", LogType::Error);
+            std::error_code rec; fs::remove(tmpP, rec);
+            return false;
+        }
+    }
+    return true;
+}
+
+// --------------------------------------------------------------------------
+// ★B6: 巨大入力による OOM を防ぐため、パース前にファイルサイズ上限で拒否する。
+//   ユーザー手編集 JSON（ChangeSet/keywords/per-mesh cache）は通常せいぜい数 MB。
+//   （深ネストによるスタックオーバーフローは別問題だが、サイズ上限が実用的な一次防御になる。）
+// --------------------------------------------------------------------------
+static const uintmax_t kMaxJsonBytes = 64ull * 1024 * 1024;
+bool FileSizeOk(const fs::path& p, uintmax_t maxBytes, const char* what) {
+    std::error_code ec;
+    uintmax_t sz = fs::file_size(p, ec);
+    if (!ec && sz > maxBytes) {
+        AddLog(std::string(what) + ": file too large, refusing to parse ("
+            + std::to_string(sz) + " bytes): " + p.string(), LogType::Error);
+        return false;
+    }
+    return true;
+}
+
+// --------------------------------------------------------------------------
 // JSON 読み込み関数 (文字列形式の slots に対応)
 // --------------------------------------------------------------------------
 void LoadKeywordsJSON() {
-    std::ifstream file(KEYWORDS_JSON_FILE);
+    std::ifstream file(AppPath(KEYWORDS_JSON_FILE)); // ★#6: 実行ファイルのディレクトリ基準
     if (!file.is_open()) {
         // ファイルがない場合はデフォルト値を設定
         g_KeywordList = {
@@ -213,6 +372,7 @@ void LoadKeywordsJSON() {
         AddLog("Keywords JSON not found. Created defaults.", LogType::Warning);
         return;
     }
+    if (!FileSizeOk(fs::path(AppPath(KEYWORDS_JSON_FILE)), kMaxJsonBytes, "keywords.json")) return;
 
     try {
         json j;
@@ -281,14 +441,11 @@ void SaveKeywordsJSON() {
                 });
         }
 
-        std::ofstream file(KEYWORDS_JSON_FILE);
-        if (file.is_open()) {
-            file << j.dump(4); // 4スペースインデント
+        // ★B7: アトミック書込（書込中クラッシュで keywords.json を 0 バイトにしない）。
+        if (AtomicWriteFile(fs::path(AppPath(KEYWORDS_JSON_FILE)), j.dump(4)))
             AddLog("Saved keywords to JSON.", LogType::Success);
-        }
-        else {
+        else
             AddLog("Failed to save keywords JSON.", LogType::Error);
-        }
     }
     catch (const std::exception& e) {
         AddLog("JSON Save Error: " + std::string(e.what()), LogType::Error);
@@ -305,8 +462,8 @@ void LoadUnifiedConfig() {
     g_SourceBlockedList = { "Skyrim.esm", "Update.esm", "Dawnguard.esm", "HearthFires.esm", "Dragonborn.esm" };
     g_KeywordBlockedList = { };
 
-    // 1. まず INI設定を読み込む
-    std::ifstream file(CONFIG_FILENAME);
+    // 1. まず INI設定を読み込む（★#6: 実行ファイルのディレクトリ基準）
+    std::ifstream file(AppPath(CONFIG_FILENAME));
     if (file.is_open()) {
         std::string line;
         int currentSection = 0;
@@ -332,13 +489,35 @@ void LoadUnifiedConfig() {
                     if (key == "InputRoot") strncpy_s(g_InputRootPath, value.c_str(), _TRUNCATE);
                     else if (key == "OutputRoot") strncpy_s(g_OutputRootPath, value.c_str(), _TRUNCATE);
                     else if (key == "GameDataPath") strncpy_s(g_GameDataPath, value.c_str(), _TRUNCATE);
-                    else if (key == "SynthesisPath") strncpy_s(g_SynthesisPath, value.c_str(), _TRUNCATE);
-                    else if (key == "Gender") g_TargetGender = std::stoi(value);
+                    else if (key == "SlotToolPath") strncpy_s(g_SlotToolPath, value.c_str(), _TRUNCATE);
+                    else if (key == "BsArchPath") strncpy_s(g_BsArchPath, value.c_str(), _TRUNCATE);
+                    else if (key == "RefBodyPath") strncpy_s(g_RefBodyPath, value.c_str(), _TRUNCATE);
+                    else if (key == "RefTexFolder") strncpy_s(g_RefTexFolder, value.c_str(), _TRUNCATE);
+                    else if (key == "SkeletonPathFemale") strncpy_s(g_SkeletonPathFemale, value.c_str(), _TRUNCATE);
+                    else if (key == "SkeletonPathMale") strncpy_s(g_SkeletonPathMale, value.c_str(), _TRUNCATE);
+                    else if (key == "ExportCostumeSeed") g_ExportCostumeSeed = (value == "1" || value == "true");
+                    else if (key == "Gender") {
+                        // ★堅牢化: 壊れた Gender 値で起動時に std::stoi 例外→クラッシュしていた。
+                        try { g_TargetGender = std::stoi(value); if (g_TargetGender != 0 && g_TargetGender != 1) g_TargetGender = 1; }
+                        catch (...) { AddLog("Config: invalid Gender value '" + value + "' (ignored).", LogType::Warning); }
+                    }
                     else if (key == "SlotDataPath") strncpy_s(g_SlotDataPath, value.c_str(), _TRUNCATE);
+                    else if (key == "TexCacheNifs") { // ★① テクスチャキャッシュ上限（NIF数）
+                        try { g_TexCacheNifLimit = std::stoi(value); if (g_TexCacheNifLimit < 0) g_TexCacheNifLimit = 0; }
+                        catch (...) { AddLog("Config: invalid TexCacheNifs value '" + value + "' (ignored).", LogType::Warning); }
+                    }
+                    else if (key == "ExportNif") g_ExportNif = (value == "1" || value == "true");
+                    else if (key == "ExportEsl") g_ExportEsl = (value == "1" || value == "true");
+                    else if (key == "ExportTxt") g_ExportTxt = (value == "1" || value == "true");
+                    else if (key == "ForceOverwrite") g_ForceOverwrite = (value == "1" || value == "true");
+                    else if (key == "LogLevel") { // ★ログレベル 0..3
+                        try { g_LogLevel = std::stoi(value); if (g_LogLevel < 0) g_LogLevel = 0; if (g_LogLevel > 3) g_LogLevel = 3; }
+                        catch (...) {}
+                    }
 					//カメラの縦Zオフセット読み込み
                     else if (key == "RefCamZOffset") {
                         try { g_RefCamZOffset = std::stof(value); }
-                        catch (...) {}
+                        catch (...) { AddLog("Config: invalid RefCamZOffset value '" + value + "' (ignored).", LogType::Warning); }
                     }
                 }
                 
@@ -378,125 +557,635 @@ void LoadUnifiedConfig() {
 }
 
 extern void SaveUnifiedConfig() {
-    std::ofstream file(CONFIG_FILENAME);
-    if (file.is_open()) {
-        file << "[General]\n";
-        file << "OutputRoot=" << g_OutputRootPath << "\n";
-        file << "GameDataPath=" << g_GameDataPath << "\n";
-        file << "SynthesisPath=" << g_SynthesisPath << "\n";
-        file << "SlotDataPath=" << g_SlotDataPath << "\n";
-        file << "Gender=" << g_TargetGender << "\n";
-        file << "RefCamZOffset=" << g_RefCamZOffset << "\n\n";
+    // ★B7: いったん文字列へ組み立て、アトミック書込で置換する（書込中クラッシュで config.ini を失わない）。
+    std::ostringstream file;
+    file << "[General]\n";
+    file << "OutputRoot=" << g_OutputRootPath << "\n";
+    file << "GameDataPath=" << g_GameDataPath << "\n";
+    file << "SlotToolPath=" << g_SlotToolPath << "\n";
+    file << "BsArchPath=" << g_BsArchPath << "\n";
+    file << "RefBodyPath=" << g_RefBodyPath << "\n";
+    file << "RefTexFolder=" << g_RefTexFolder << "\n";
+    file << "SkeletonPathFemale=" << g_SkeletonPathFemale << "\n"; // ★スケルトン解決パス（女性）
+    file << "SkeletonPathMale=" << g_SkeletonPathMale << "\n";     // ★スケルトン解決パス（男性）
+    file << "ExportCostumeSeed=" << (g_ExportCostumeSeed ? 1 : 0) << "\n"; // ★衣装シード出力トグル
+    file << "SlotDataPath=" << g_SlotDataPath << "\n";
+    file << "Gender=" << g_TargetGender << "\n";
+    file << "TexCacheNifs=" << g_TexCacheNifLimit << "\n"; // ★① テクスチャキャッシュ上限（NIF数）
+    file << "ExportNif=" << (g_ExportNif ? 1 : 0) << "\n"; // ★統合 Export トグル
+    file << "ExportEsl=" << (g_ExportEsl ? 1 : 0) << "\n";
+    file << "ExportTxt=" << (g_ExportTxt ? 1 : 0) << "\n";
+    file << "ForceOverwrite=" << (g_ForceOverwrite ? 1 : 0) << "\n"; // ★Force Overwrite
+    file << "LogLevel=" << g_LogLevel << "\n"; // ★ログレベル
+    file << "RefCamZOffset=" << g_RefCamZOffset << "\n\n";
 
-        file << "[Slots]\n";
-        for (const auto& pair : SlotDictionary::slotMap) {
-            file << pair.first << "=" << pair.second << "\n";
-        }
-
-        file << "\n[BlockedList]\n";
-        for (const auto& bl : g_SourceBlockedList) {
-            file << bl << "\n";
-        }
-
-        file << "\n[KwBlockedList]\n";
-        for (const auto& kbl : g_KeywordBlockedList) {
-            file << kbl << "\n";
-        }
-        file << "\n";
-
-        AddLog("Unified Config Saved (INI).", LogType::Success);
+    file << "[Slots]\n";
+    for (const auto& pair : SlotDictionary::slotMap) {
+        file << pair.first << "=" << pair.second << "\n";
     }
+
+    file << "\n[BlockedList]\n";
+    for (const auto& bl : g_SourceBlockedList) {
+        file << bl << "\n";
+    }
+
+    file << "\n[KwBlockedList]\n";
+    for (const auto& kbl : g_KeywordBlockedList) {
+        file << kbl << "\n";
+    }
+    file << "\n";
+
+    if (AtomicWriteFile(fs::path(AppPath(CONFIG_FILENAME)), file.str())) // ★#6: 実行ファイルのディレクトリ基準
+        AddLog("Unified Config Saved (INI).", LogType::Success);
+    else
+        AddLog("Failed to save config (INI).", LogType::Error);
 
     SaveKeywordsJSON();
 }
 
-static void SaveSessionChangesToFileFiltered(const std::map<std::string, SlotRecord>& filtered) {
-    if (filtered.empty()) return;
+// ============================================================
+// ★per-mesh: ChangeSet JSON（slotdata-ChangeSet.json）I/O
+//   旧 slotdata-Output.txt（9列 CSV・union のみ）を置換。ユーザー編集（per-mesh meshes[] 込み）を
+//   永続化する batch/編集履歴。pending の保存先・バッチ入力。旧 txt とは非互換（ハードブレーク）。
+// ============================================================
+static const char* CHANGESET_FILENAME = "slotdata-ChangeSet.json";
+
+static std::string SlotsCsv(const std::vector<int>& v) {
+    std::string s; for (size_t i = 0; i < v.size(); ++i) { if (i) s += ","; s += std::to_string(v[i]); } return s;
+}
+
+static json SlotRecordToChangeJson(const SlotRecord& r) {
+    json j;
+    j["source"] = NormalizePatchSource(r.sourceFile); // ★要望①: 二重サフィックス集約（書込時）
+    j["armaFormKey"] = r.armaFormKey;
+    j["armoFormKey"] = r.armoFormKey;
+    j["armaFormID"] = r.armaFormID;
+    j["armoFormID"] = r.armoFormID;
+    j["armaEditorId"] = r.armaEditorID;
+    j["armoEditorId"] = r.armoEditorID;
+    j["malePath"] = r.malePath;
+    j["femalePath"] = r.femalePath;
+    j["armaSlots"] = ParseSlotString(r.armaSlots); // int 配列で保存
+    j["armoSlots"] = ParseSlotString(r.armoSlots);
+    j["blockingSlots"] = r.blockingSlots;
+    j["isOspSource"] = r.isOspSource;
+    j["pendingOnly"] = r.pendingOnly;
+    j["originalNifPath"] = r.originalNifPath;
+
+    // shapeIndex → ShapeBone の索引（meshes[] にボーン情報を付加するため）。
+    std::map<int, const ShapeBone*> sbByIdx;
+    for (const auto& sb : r.shapeBones) sbByIdx[sb.shapeIndex] = &sb;
+
+    json ms = json::array();
+    for (const auto& m : r.meshes) {
+        json mj{ {"shapeIndex", m.shapeIndex}, {"name", m.name}, {"slots", m.slots}, {"toNiSkin", m.toNiSkin} };
+        // ★スキンボーン抽出: 既存フィールドは温存し hasSkin/bones/skeletonRoot を加算。
+        auto it = sbByIdx.find(m.shapeIndex);
+        if (it != sbByIdx.end()) {
+            mj["hasSkin"] = it->second->hasSkin;
+            mj["bones"] = it->second->bones;
+            mj["skeletonRoot"] = it->second->skeletonRoot.empty() ? json(nullptr) : json(it->second->skeletonRoot);
+        } else {
+            // meshes[]（BSD）に対応する ShapeBone が無い稀ケースは BSD=skinned とみなす。
+            mj["hasSkin"] = true;
+            mj["bones"] = json::array();
+            mj["skeletonRoot"] = nullptr;
+        }
+        ms.push_back(mj);
+    }
+    j["meshes"] = ms;
+
+    // ★スキンボーン抽出: 全 shape を網羅する shapes[]（リジッド/NiSkin も含む）。
+    json shapesArr = json::array();
+    for (const auto& sb : r.shapeBones)
+        shapesArr.push_back(json{
+            {"shapeIndex", sb.shapeIndex}, {"name", sb.name}, {"hasSkin", sb.hasSkin},
+            {"bones", sb.bones}, {"skeletonRoot", sb.skeletonRoot.empty() ? json(nullptr) : json(sb.skeletonRoot)} });
+    j["shapes"] = shapesArr;
+
+    // ★スケルトン解決パス: boneResolution（判定済みのときのみ出力）。
+    if (r.boneRes.computed) {
+        json br;
+        br["skeleton"] = r.boneRes.skeleton;
+        br["gender"] = r.boneRes.gender;
+        br["resolved"] = (r.boneRes.resolved < 0) ? json(nullptr) : json(r.boneRes.resolved != 0);
+        br["missingBones"] = r.boneRes.missingBones;
+        br["unskinnedShapes"] = r.boneRes.unskinnedShapes;
+        if (!r.boneRes.note.empty()) br["note"] = r.boneRes.note;
+        j["boneResolution"] = br;
+    }
+    return j;
+}
+
+static SlotRecord ChangeJsonToSlotRecord(const json& j) {
+    SlotRecord r;
+    r.sourceFile = NormalizePatchSource(j.value("source", "")); // ★要望①: 二重サフィックス集約（読込時）
+    r.armaFormKey = j.value("armaFormKey", "");
+    r.armoFormKey = j.value("armoFormKey", "");
+    r.armaFormID = j.value("armaFormID", "");
+    r.armoFormID = j.value("armoFormID", "");
+    r.armaEditorID = j.value("armaEditorId", "");
+    r.armoEditorID = j.value("armoEditorId", "");
+    r.malePath = j.value("malePath", "");
+    r.femalePath = j.value("femalePath", "");
+    if (j.contains("armaSlots") && j["armaSlots"].is_array()) r.armaSlots = SlotsCsv(j["armaSlots"].get<std::vector<int>>());
+    if (j.contains("armoSlots") && j["armoSlots"].is_array()) r.armoSlots = SlotsCsv(j["armoSlots"].get<std::vector<int>>());
+    if (j.contains("blockingSlots") && j["blockingSlots"].is_array()) r.blockingSlots = j["blockingSlots"].get<std::vector<int>>();
+    r.isOspSource = j.value("isOspSource", false);
+    r.pendingOnly = j.value("pendingOnly", false);
+    r.originalNifPath = j.value("originalNifPath", "");
+    if (j.contains("meshes") && j["meshes"].is_array()) {
+        for (const auto& mj : j["meshes"]) {
+            MeshSlot m;
+            m.shapeIndex = mj.value("shapeIndex", -1);
+            m.name = mj.value("name", "");
+            if (mj.contains("slots") && mj["slots"].is_array()) m.slots = mj["slots"].get<std::vector<int>>();
+            m.toNiSkin = mj.value("toNiSkin", false);
+            r.meshes.push_back(m);
+        }
+    }
+    // ★スキンボーン抽出: shapes[]（全 shape のボーン情報）を復元（無ければ空＝旧 /1 互換）。
+    if (j.contains("shapes") && j["shapes"].is_array()) {
+        for (const auto& sj : j["shapes"]) {
+            ShapeBone sb;
+            sb.shapeIndex = sj.value("shapeIndex", -1);
+            sb.name = sj.value("name", "");
+            sb.hasSkin = sj.value("hasSkin", false);
+            if (sj.contains("bones") && sj["bones"].is_array()) sb.bones = sj["bones"].get<std::vector<std::string>>();
+            if (sj.contains("skeletonRoot") && sj["skeletonRoot"].is_string()) sb.skeletonRoot = sj["skeletonRoot"].get<std::string>();
+            r.shapeBones.push_back(std::move(sb));
+        }
+    }
+    // ★スケルトン解決パス: boneResolution を復元（読込後の再判定は呼び出し側が必要なら上書きする）。
+    if (j.contains("boneResolution") && j["boneResolution"].is_object()) {
+        const auto& bj = j["boneResolution"];
+        BoneResolution br;
+        br.computed = true;
+        br.skeleton = bj.value("skeleton", "");
+        br.gender = bj.value("gender", "");
+        if (bj.contains("resolved") && bj["resolved"].is_boolean()) br.resolved = bj["resolved"].get<bool>() ? 1 : 0;
+        else br.resolved = -1; // null
+        if (bj.contains("missingBones") && bj["missingBones"].is_array()) br.missingBones = bj["missingBones"].get<std::vector<std::string>>();
+        if (bj.contains("unskinnedShapes") && bj["unskinnedShapes"].is_array()) br.unskinnedShapes = bj["unskinnedShapes"].get<std::vector<std::string>>();
+        br.note = bj.value("note", "");
+        r.boneRes = br;
+    }
+    // 表示・export 用の補完（nifPath は表示 gender 優先）
+    if (g_TargetGender == 0) r.nifPath = !r.malePath.empty() ? r.malePath : r.femalePath;
+    else r.nifPath = !r.femalePath.empty() ? r.femalePath : r.malePath;
+    r.displayText = !r.armaEditorID.empty() ? r.armaEditorID
+        : ("[" + (r.armaFormID.empty() ? "?" : r.armaFormID) + " " + r.sourceFile + "]");
+    return r;
+}
+
+// ★衣装シード（利用側プロジェクトへの受け渡しシード）: ChangeSet と**独立**に costume_seed.json を出力。
+//   changeset は編集履歴の意味論を持つため、未編集アクセサリ（ネイル等）を含む全件は seed 側で受け渡す。
+//   呼び出し元は Import DB（全件＝uniqueRecords）／Convert（変換 recs）。トグル ON のときのみ。
+//   各要素: { id, nif_path, gender, bones, resolved, default_enabled:null, strip_class:null }。
+//   ポリシー項目（default_enabled / strip_class）は NIF から導出不能なので**必ず null**（境界: NSS は決めない）。
+//   bones は全スキンドシェイプのボーン和集合。**スキンドシェイプを1つも持たないレコードは除外**
+//   （リジッド専用＝アタッチ候補でない）。表示 gender 分のみ（NSS は表示 gender の NIF のみ読む）。
+void WriteCostumeSeed(const std::map<std::string, SlotRecord>& records) {
+    if (strlen(g_SlotDataPath) == 0) { AddLog("costume seed: SlotData folder not set; skipped.", LogType::Warning); return; }
+    std::string genderLabel = (g_TargetGender == 0) ? "male" : "female";
+
+    json arr = json::array();
+    int skippedNoSkin = 0, skippedNoId = 0;
+    for (const auto& [k, r] : records) {
+        // ボーン和集合（全スキンドシェイプ）。挿入順を保ちつつ重複排除。
+        std::vector<std::string> bones; std::set<std::string> seen;
+        bool anySkin = false;
+        for (const auto& sb : r.shapeBones) {
+            if (!sb.hasSkin) continue;
+            anySkin = true;
+            for (const auto& bn : sb.bones) if (seen.insert(bn).second) bones.push_back(bn);
+        }
+        if (!anySkin) { ++skippedNoSkin; continue; } // スキンド shape 無し＝アタッチ候補でない → 除外
+
+        // ★id は常に Mutagen FormKey 形 "XXXXXX:Plugin.esp" に統一する（changeset の armaFormKey と一致）。
+        //   FormKey が空（txt 由来で未補完）なら armaFormID + ":" + 定義元 source で再構成。
+        //   FormID も空なら安定 id を作れない＝アタッチ対象として解決不能なのでスキップ（ガード）。
+        std::string id;
+        if (!r.armaFormKey.empty()) id = r.armaFormKey;
+        else if (!r.armaFormID.empty()) id = r.armaFormID + ":" + NormalizePatchSource(r.sourceFile);
+        else {
+            ++skippedNoId;
+            AddLog("costume seed: skipped a record with no FormKey/FormID (no stable id): "
+                + (r.armaEditorID.empty() ? r.sourceFile : r.armaEditorID), LogType::Warning);
+            continue;
+        }
+
+        std::string nifPath = (g_TargetGender == 0)
+            ? (!r.malePath.empty() ? r.malePath : r.femalePath)
+            : (!r.femalePath.empty() ? r.femalePath : r.malePath);
+
+        json e;
+        e["id"] = id;
+        e["nif_path"] = nifPath;
+        e["gender"] = genderLabel;
+        e["bones"] = bones;
+        // resolved は boneResolution 由来の三値（未判定なら null）。
+        e["resolved"] = (!r.boneRes.computed || r.boneRes.resolved < 0) ? json(nullptr) : json(r.boneRes.resolved != 0);
+        e["default_enabled"] = nullptr; // ★境界: NSS は決めない（利用側が埋める）
+        e["strip_class"] = nullptr;     // ★境界: NSS は決めない（利用側が埋める）
+        arr.push_back(e);
+    }
+
+    json doc;
+    doc["schema"] = "nifslot.costumeseed/1";
+    doc["gender"] = genderLabel; // この seed がどの表示 gender 分か（別 gender は当該 gender で Import DB 再実行）
+    doc["seeds"] = arr;
+
+    fs::path outP = fs::path(g_SlotDataPath) / "costume_seed.json";
+    // NIF 由来文字列（shape 名/ボーン名）を含むため replace モードで dump。
+    if (!AtomicWriteFile(outP, doc.dump(2, ' ', false, json::error_handler_t::replace)))
+        AddLog("costume_seed.json write failed: " + outP.string(), LogType::Warning);
+    else
+        AddLog("costume_seed.json: " + std::to_string(arr.size()) + " seed(s) written ("
+            + std::to_string(skippedNoSkin) + " non-skinned, " + std::to_string(skippedNoId)
+            + " no-id skipped).", LogType::Success);
+}
+
+// 既存 ChangeSet を読み、key(source_armaFormID) で merge してから書き戻す。
+static void WriteChangeSet(const std::map<std::string, SlotRecord>& changes) {
+    if (changes.empty()) return;
     if (strlen(g_SlotDataPath) == 0) return;
-
     fs::create_directories(g_SlotDataPath);
-    fs::path outP = fs::path(g_SlotDataPath) / "slotdata-Output.txt";
+    fs::path outP = fs::path(g_SlotDataPath) / CHANGESET_FILENAME;
 
-    // 既存ファイルの読み込み
-    std::vector<std::string> fileLines;
-    if (fs::exists(outP)) {
-        std::ifstream inFile(outP);
-        std::string line;
-        while (std::getline(inFile, line)) {
-            if (!line.empty()) {
-                if (line.back() == '\r') line.pop_back();
-                fileLines.push_back(line);
-            }
+    std::map<std::string, json> byKey; // 既存をキーで保持し上書き merge
+    if (fs::exists(outP) && FileSizeOk(outP, kMaxJsonBytes, "ChangeSet(existing)")) {
+        std::ifstream in(outP);
+        try {
+            json existing; in >> existing;
+            if (existing.contains("changes") && existing["changes"].is_array())
+                for (const auto& cj : existing["changes"]) {
+                    // ★要望①: 既存行の source も正規化して再キー（旧 *_SlotPatch_SlotPatch 行を集約・自己修復）。
+                    json fixed = cj;
+                    std::string ns = NormalizePatchSource(cj.value("source", ""));
+                    fixed["source"] = ns;
+                    byKey[ns + "_" + cj.value("armaFormID", "")] = fixed;
+                }
         }
-        inFile.close();
+        catch (...) { AddLog("ChangeSet: existing JSON unreadable; rewriting from current pending.", LogType::Warning); }
     }
 
-    int updatedCount = 0;
-    int newCount = 0;
-
-    auto JoinLine = [](const std::vector<std::string>& tokens) {
-        std::string res;
-        for (size_t i = 0; i < tokens.size(); i++) {
-            res += tokens[i];
-            if (i < tokens.size() - 1) res += ";";
-        }
-        return res;
-        };
-
-    // filtered の各レコードを既存行に反映、見つからなければ新規追加
-    for (const auto& pair : filtered) {
-        const auto& newRec = pair.second;
-        bool found = false;
-
-        for (auto& line : fileLines) {
-            std::vector<std::string> tokens = SplitString(line, ';');
-            if (tokens.size() < 9) continue;
-
-            auto norm = [](const std::string& s) { return NormalizePathForComparison(s); };
-
-            if (tokens[0] == newRec.sourceFile &&
-                tokens[1] == newRec.armaFormID &&
-                tokens[2] == newRec.armaEditorID &&
-                tokens[3] == newRec.armoFormID &&
-                tokens[4] == newRec.armoEditorID &&
-                norm(tokens[5]) == norm(newRec.malePath) &&
-                norm(tokens[6]) == norm(newRec.femalePath)) {
-
-                tokens[7] = newRec.armoSlots;
-                tokens[8] = newRec.armaSlots;
-                line = JoinLine(tokens);
-                found = true;
-                updatedCount++;
-                break;
-            }
-        }
-
-        if (!found) {
-            std::stringstream ss;
-            ss << newRec.sourceFile << ";" << newRec.armaFormID << ";" << newRec.armaEditorID << ";"
-                << newRec.armoFormID << ";" << newRec.armoEditorID << ";"
-                << newRec.malePath << ";" << newRec.femalePath << ";"
-                << newRec.armoSlots << ";" << newRec.armaSlots;
-            fileLines.push_back(ss.str());
-            newCount++;
-        }
+    int updated = 0, added = 0;
+    for (const auto& [k, rec] : changes) {
+        std::string fileKey = NormalizePatchSource(rec.sourceFile) + "_" + rec.armaFormID;
+        if (byKey.count(fileKey)) ++updated; else ++added;
+        byKey[fileKey] = SlotRecordToChangeJson(rec);
     }
 
-    // ファイルに書き戻す
-    std::ofstream outFile(outP);
-    if (!outFile.is_open()) { AddLog("Write failed: " + outP.string(), LogType::Error); return; }
-    for (const auto& line : fileLines) outFile << line << "\n";
-    outFile.close();
+    json doc;
+    doc["schema"] = "nifslot.changeset/2"; // ★スキンボーン抽出: bones/shapes/boneResolution を加算（既存フィールドは温存）
+    json arr = json::array();
+    for (auto& [k, cj] : byKey) arr.push_back(cj);
+    doc["changes"] = arr;
+    // ★衣装シードは changeset とは独立（changeset は編集履歴の意味論を保つ）。
+    //   seed は Import DB / Convert 完了時に全件 DB から WriteCostumeSeed で出力する。ここでは出さない。
 
-    // 保存済みレコードを g_SessionChanges から削除（排他）
+    // ★NIF 由来の名前に不正 UTF-8 がありうるため replace モードで dump（strict だと例外で落ちる）。
+    std::string outStr = doc.dump(2, ' ', false, json::error_handler_t::replace);
+
+    // ★B1: 最重要データ（全編集履歴）なので、書込前に直近 1 世代を .bak へ退避（破損時の復旧用）。
     {
-        std::lock_guard<std::mutex> lock(g_DataMutex);
-        for (const auto& pair : filtered) {
-            if (g_SessionChanges.count(pair.first)) g_SessionChanges.erase(pair.first);
+        std::error_code bec;
+        if (fs::exists(outP, bec)) {
+            fs::path bak = outP; bak += ".bak";
+            fs::copy_file(outP, bak, fs::copy_options::overwrite_existing, bec);
+            if (bec) AddLog("ChangeSet: .bak backup failed (continuing): " + bec.message(), LogType::Warning);
         }
     }
 
-    AddLog("Saved (filtered): " + std::to_string(updatedCount) + " updated, " + std::to_string(newCount) + " new.", LogType::Success);
+    // ★B1: アトミック書込（temp→rename）。書込中クラッシュ/電源断で全編集履歴を失わない。
+    if (!AtomicWriteFile(outP, outStr)) { AddLog("ChangeSet write failed: " + outP.string(), LogType::Error); return; }
+    AddLog(std::string(CHANGESET_FILENAME) + ": " + std::to_string(updated) + " updated, " + std::to_string(added) + " new.", LogType::Success);
+}
+
+// ChangeSet を読み out（key=source_armaFormID）に詰める。loaded/skipped を返す。存在/失敗で false。
+static bool ReadChangeSet(std::map<std::string, SlotRecord>& out, int& loaded, int& skipped) {
+    loaded = 0; skipped = 0;
+    if (strlen(g_SlotDataPath) == 0) return false;
+    fs::path inP = fs::path(g_SlotDataPath) / CHANGESET_FILENAME;
+    if (!fs::exists(inP)) return false;
+    if (!FileSizeOk(inP, kMaxJsonBytes, "ChangeSet")) return false;
+    std::ifstream in(inP);
+    json doc;
+    try { in >> doc; }
+    catch (const std::exception& e) { AddLog(std::string("ChangeSet parse error: ") + e.what(), LogType::Error); return false; }
+    if (!doc.contains("changes") || !doc["changes"].is_array()) return false;
+    for (const auto& cj : doc["changes"]) {
+        SlotRecord r = ChangeJsonToSlotRecord(cj);
+        if (r.sourceFile.empty() && r.armaFormID.empty()) { ++skipped; continue; }
+        out[r.sourceFile + "_" + r.armaFormID] = r;
+        ++loaded;
+    }
+    return true;
+}
+
+// txt 用の filtered 書き出し関数を ChangeSet JSON 書き出しに置換（呼び出し側 worker は変更不要）。
+static void SaveSessionChangesToFileFiltered(const std::map<std::string, SlotRecord>& filtered) {
+    WriteChangeSet(filtered);
+}
+
+// ============================================================
+// ★per-mesh ディスクキャッシュ: NIF パス毎の meshes[] を mtime+size 検証付きで永続化する。
+//   Import DB の最大コスト（全ユニーク NIF の読込・パース）を、内容が変わっていない NIF について
+//   2 回の stat（file_size + last_write_time）に置き換えてスキップする。
+//   ファイル: 実行ディレクトリの nss_permesh_cache.json（再生成可能なので消しても安全＝強制リビルド）。
+//   単一ワーカー（ImportWorker）内でのみ使用するためロック不要（g_IsProcessing で排他）。
+// ============================================================
+static const char* PERMESH_CACHE_FILENAME = "nss_permesh_cache.json";
+// ★スキンボーン抽出: schema を /2 に上げ、shapeBones（全 shape のボーン情報）も保存する。
+//   旧 /1 キャッシュはボーンを持たないため、ロード時に破棄して NIF を1回だけ再読込させる（再生成可・安全）。
+static const char* PERMESH_CACHE_SCHEMA = "nifslot.permeshcache/2";
+struct PerMeshCacheEntry { long long mtime = 0; unsigned long long size = 0; std::vector<MeshSlot> meshes; std::vector<ShapeBone> shapeBones; };
+static std::map<std::string, PerMeshCacheEntry> g_PerMeshCache;
+
+static std::string PmcKey(const std::string& fullPath) {
+    std::string k = fullPath;
+    AsciiLowerInplace(k); // ★B5: per-mesh キャッシュキー（パス）
+    return k;
+}
+
+void PerMeshCache_Load() {
+    g_PerMeshCache.clear();
+    fs::path p(AppPath(PERMESH_CACHE_FILENAME)); // ★#6: 実行ファイルのディレクトリ基準
+    std::error_code ec;
+    if (!fs::exists(p, ec)) return;
+    if (!FileSizeOk(p, kMaxJsonBytes, "per-mesh cache")) return;
+    std::ifstream in(p);
+    json doc;
+    try { in >> doc; }
+    catch (...) { AddLog("per-mesh cache unreadable; will rebuild from NIFs.", LogType::Warning); return; }
+    // ★スキンボーン抽出: schema が /2 でなければ（旧 /1 等）丸ごと破棄して NIF から再構築させる。
+    if (doc.value("schema", std::string()) != PERMESH_CACHE_SCHEMA) {
+        AddLog("per-mesh cache schema mismatch (expected /2); rebuilding from NIFs (one-time).", LogType::Info);
+        return;
+    }
+    if (!doc.contains("entries") || !doc["entries"].is_array()) return;
+    for (const auto& e : doc["entries"]) {
+        std::string key = e.value("path", "");
+        if (key.empty()) continue;
+        PerMeshCacheEntry ent;
+        ent.mtime = e.value("mtime", (long long)0);
+        ent.size = e.value("size", (unsigned long long)0);
+        if (e.contains("meshes") && e["meshes"].is_array()) {
+            for (const auto& mj : e["meshes"]) {
+                MeshSlot m;
+                m.shapeIndex = mj.value("shapeIndex", -1);
+                m.name = mj.value("name", "");
+                if (mj.contains("slots") && mj["slots"].is_array()) m.slots = mj["slots"].get<std::vector<int>>();
+                ent.meshes.push_back(m);
+            }
+        }
+        if (e.contains("shapeBones") && e["shapeBones"].is_array()) {
+            for (const auto& sj : e["shapeBones"]) {
+                ShapeBone sb;
+                sb.shapeIndex = sj.value("shapeIndex", -1);
+                sb.name = sj.value("name", "");
+                sb.hasSkin = sj.value("hasSkin", false);
+                if (sj.contains("bones") && sj["bones"].is_array()) sb.bones = sj["bones"].get<std::vector<std::string>>();
+                sb.skeletonRoot = sj.value("skeletonRoot", "");
+                ent.shapeBones.push_back(std::move(sb));
+            }
+        }
+        g_PerMeshCache[key] = std::move(ent);
+    }
+}
+
+bool PerMeshCache_Get(const std::string& fullPath, std::vector<MeshSlot>& out, std::vector<ShapeBone>& outBones) {
+    auto it = g_PerMeshCache.find(PmcKey(fullPath));
+    if (it == g_PerMeshCache.end()) return false;
+    std::error_code ec;
+    auto sz = fs::file_size(fullPath, ec); if (ec) return false;
+    auto wt = fs::last_write_time(fullPath, ec); if (ec) return false;
+    long long wtc = (long long)wt.time_since_epoch().count();
+    if (it->second.size != (unsigned long long)sz || it->second.mtime != wtc) return false; // 変更あり → 無効
+    out = it->second.meshes;
+    outBones = it->second.shapeBones;
+    return true;
+}
+
+bool PerMeshCache_Get(const std::string& fullPath, std::vector<MeshSlot>& out) {
+    std::vector<ShapeBone> dummy;
+    return PerMeshCache_Get(fullPath, out, dummy);
+}
+
+void PerMeshCache_Put(const std::string& fullPath, const std::vector<MeshSlot>& meshes, const std::vector<ShapeBone>& bones) {
+    std::error_code ec;
+    auto sz = fs::file_size(fullPath, ec); if (ec) return;         // 存在しない/読めない → キャッシュしない
+    auto wt = fs::last_write_time(fullPath, ec); if (ec) return;
+    PerMeshCacheEntry ent;
+    ent.mtime = (long long)wt.time_since_epoch().count();
+    ent.size = (unsigned long long)sz;
+    ent.meshes = meshes;
+    ent.shapeBones = bones;
+    g_PerMeshCache[PmcKey(fullPath)] = std::move(ent);
+}
+
+void PerMeshCache_Put(const std::string& fullPath, const std::vector<MeshSlot>& meshes) {
+    PerMeshCache_Put(fullPath, meshes, std::vector<ShapeBone>{});
+}
+
+void PerMeshCache_Save() {
+    json doc;
+    doc["schema"] = PERMESH_CACHE_SCHEMA;
+    json arr = json::array();
+    for (const auto& [k, ent] : g_PerMeshCache) {
+        json e;
+        e["path"] = k;
+        e["mtime"] = ent.mtime;
+        e["size"] = ent.size;
+        json ms = json::array();
+        for (const auto& m : ent.meshes)
+            ms.push_back(json{ {"shapeIndex", m.shapeIndex}, {"name", m.name}, {"slots", m.slots} });
+        e["meshes"] = ms;
+        // ★スキンボーン抽出: 全 shape のボーン情報も保存（次回 Import DB でボーン込み即復元）。
+        json sbArr = json::array();
+        for (const auto& sb : ent.shapeBones)
+            sbArr.push_back(json{ {"shapeIndex", sb.shapeIndex}, {"name", sb.name}, {"hasSkin", sb.hasSkin},
+                                  {"bones", sb.bones}, {"skeletonRoot", sb.skeletonRoot} });
+        e["shapeBones"] = sbArr;
+        arr.push_back(e);
+    }
+    doc["entries"] = arr;
+    // ★NIF の shape 名は不正 UTF-8 を含みうる。strict dump だと type_error 例外で落ちるため replace モード
+    //   （不正バイトを U+FFFD に置換）で書き出す。コンパクト（内部キャッシュなので最小サイズ優先）。
+    // ★B7: アトミック書込（破損しても再生成可能だが、0 バイト残骸を避ける）。
+    if (!AtomicWriteFile(fs::path(AppPath(PERMESH_CACHE_FILENAME)), doc.dump(-1, ' ', false, json::error_handler_t::replace)))
+        AddLog("per-mesh cache write failed.", LogType::Warning);
+}
+
+// ============================================================
+// ★移行ユーティリティ: 旧 slotdata-Output.txt（9列CSV・union のみ）→ slotdata-ChangeSet.json
+//   ハードブレークで失った旧編集を、各レコードの NIF を読んで per-mesh として復元する
+//   （Import DB の per-mesh フェーズと同手順・同キャッシュ）。NIF が読めない行は union のみで書き出し、
+//   export 時に union フォールバックする。スレッドで起動する（進捗・キャンセル可）。
+// ============================================================
+void ConvertOldSlotdataToChangeSet() {
+    g_IsProcessing = true;
+    g_CancelRequested = false;
+    g_ProcessCancelable = true;
+    g_Progress = 0.0f;
+    struct Guard { ~Guard() { g_ProcessCancelable = true; g_IsProcessing = false; } } guard;
+    try { // ★A1: 本体全体を例外境界で保護（txt パース/WriteChangeSet 段も含める）。
+
+    if (strlen(g_SlotDataPath) == 0) { AddLog("Convert: SlotData folder is not set (Settings).", LogType::Warning); return; }
+
+    // 旧 txt を探す（大文字小文字どちらも）
+    fs::path inP = fs::path(g_SlotDataPath) / "slotdata-Output.txt";
+    if (!fs::exists(inP)) {
+        fs::path lower = fs::path(g_SlotDataPath) / "slotdata-output.txt";
+        if (fs::exists(lower)) inP = lower;
+        else { AddLog("Convert: slotdata-Output.txt not found in " + std::string(g_SlotDataPath), LogType::Warning); return; }
+    }
+
+    // 1) 旧 txt をパース（key = source_armaFormID）
+    std::map<std::string, SlotRecord> recs;
+    {
+        std::ifstream f(inP);
+        if (!f) { AddLog("Convert: failed to open " + inP.string(), LogType::Error); return; }
+        std::string line; int parsed = 0, skipped = 0;
+        while (std::getline(f, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line.empty()) continue;
+            auto cols = SplitString(line, ';');
+            if (cols.size() < 9) { ++skipped; continue; }
+            SlotRecord r;
+            r.sourceFile = NormalizePatchSource(cols[0]); r.armaFormID = cols[1]; r.armaEditorID = cols[2]; // ★要望①
+            r.armoFormID = cols[3]; r.armoEditorID = cols[4];
+            r.malePath = cols[5]; r.femalePath = cols[6];
+            r.armoSlots = cols[7]; r.armaSlots = cols[8];
+            r.displayText = !r.armaEditorID.empty() ? r.armaEditorID
+                : ("[" + (r.armaFormID.empty() ? "?" : r.armaFormID) + " " + r.sourceFile + "]");
+            recs[r.sourceFile + "_" + r.armaFormID] = r;
+            ++parsed;
+        }
+        AddLog("Convert: parsed " + std::to_string(parsed) + " row(s) from " + inP.filename().string()
+            + (skipped ? (" (skipped " + std::to_string(skipped) + " malformed)") : ""), LogType::Info);
+    }
+    if (recs.empty()) { AddLog("Convert: nothing to convert.", LogType::Warning); return; }
+
+    // ★#7(A): 旧 txt は full FormKey を持たず、Export 時の FormKey 再構成（FormID + winner source）が
+    //   定義元 mod と一致しないため不確実。ここで live DB（Import DB の slottool 由来＝full FormKey 付き）と
+    //   ARMA/ARMO EditorID で突合し、real FormKey を補完する。突合できた行は再構成不要になり安全。
+    //   前提: 先に「Import DB (slottool)」を実行して g_AllRecords を構築しておくこと。
+    {
+        // EditorID(小文字) -> FormKey の索引を live DB から構築（g_DataMutex 下でスナップショット）。
+        std::map<std::string, std::string> armaByEid, armoByEid;
+        size_t dbSize = 0;
+        {
+            std::lock_guard<std::recursive_mutex> lk(g_DataMutex);
+            dbSize = g_AllRecords.size();
+            auto lower = [](std::string s) { std::transform(s.begin(), s.end(), s.begin(), ::tolower); return s; };
+            for (const auto& r : g_AllRecords) {
+                if (!r.armaEditorID.empty() && !r.armaFormKey.empty()) armaByEid.emplace(lower(r.armaEditorID), r.armaFormKey);
+                if (!r.armoEditorID.empty() && !r.armoFormKey.empty()) armoByEid.emplace(lower(r.armoEditorID), r.armoFormKey);
+            }
+        }
+        if (dbSize == 0) {
+            AddLog("Convert: live DB is empty - FormKeys will NOT be backfilled. "
+                   "Run 'Import DB (slottool)' first so converted records get real FormKeys "
+                   "(otherwise ESL export relies on unreliable FormKey reconstruction).", LogType::Warning);
+        }
+        else {
+            auto lower = [](std::string s) { std::transform(s.begin(), s.end(), s.begin(), ::tolower); return s; };
+            int filledArma = 0, filledArmo = 0, missArma = 0, missArmo = 0;
+            for (auto& [k, r] : recs) {
+                if (r.armaFormKey.empty() && !r.armaEditorID.empty()) {
+                    auto it = armaByEid.find(lower(r.armaEditorID));
+                    if (it != armaByEid.end()) { r.armaFormKey = it->second; ++filledArma; }
+                    else ++missArma;
+                }
+                if (r.armoFormKey.empty() && !r.armoEditorID.empty()) {
+                    auto it = armoByEid.find(lower(r.armoEditorID));
+                    if (it != armoByEid.end()) { r.armoFormKey = it->second; ++filledArmo; }
+                    else ++missArmo;
+                }
+            }
+            AddLog("Convert: FormKey backfill via DB EditorID match: ARMA " + std::to_string(filledArma)
+                + " filled / " + std::to_string(missArma) + " unmatched; ARMO " + std::to_string(filledArmo)
+                + " filled / " + std::to_string(missArmo) + " unmatched.",
+                (missArma + missArmo > 0) ? LogType::Warning : LogType::Success);
+            if (missArma + missArmo > 0)
+                AddLog("Convert: unmatched rows keep empty FormKey and will fall back to FormID+source "
+                       "reconstruction at ESL export (may resolve to the wrong plugin). "
+                       "Re-run Import DB or verify those records manually.", LogType::Warning);
+        }
+    }
+
+    // ★スケルトン解決パス: 表示 gender のスケルトン名集合を一度だけ構築（複数 NIF 可・';' 区切り）。
+    std::set<std::string> skelSet; std::string skelId;
+    {
+        const char* skelCfg = (g_TargetGender == 0) ? g_SkeletonPathMale : g_SkeletonPathFemale;
+        if (skelCfg && strlen(skelCfg) > 0) {
+            if (BuildSkeletonBoneSet(skelCfg, skelSet, skelId))
+                AddLog("Convert: skeleton bone set built from '" + skelId + "' (" + std::to_string(skelSet.size()) + " nodes).", LogType::Info);
+            else
+                AddLog("Convert: skeleton NIF(s) unreadable; boneResolution will be null.", LogType::Warning);
+        }
+    }
+    std::string genderLabel = (g_TargetGender == 0) ? "male" : "female";
+
+    // 2) per-mesh 復元（Import DB と同手順・キャッシュ利用）。例外でも DB は壊さない（union のみで継続）。
+    try {
+        PerMeshCache_Load();
+        std::map<std::string, std::vector<MeshSlot>> nifMeshCache;
+        std::map<std::string, std::vector<ShapeBone>> nifBoneCache; // ★スキンボーン抽出
+        int total = (int)recs.size(), cur = 0, withMesh = 0, cacheHit = 0, nifRead = 0;
+        for (auto& [k, rec] : recs) {
+            if (g_CancelRequested) { AddLog("Convert: canceled (nothing written).", LogType::Warning); return; }
+            ++cur; g_Progress = total > 0 ? (float)cur / (float)total : 1.0f;
+            std::string rel = (g_TargetGender == 0) ? rec.malePath : rec.femalePath;
+            if (rel.empty()) rel = (g_TargetGender == 0) ? rec.femalePath : rec.malePath;
+            if (rel.empty()) continue;
+            std::string full = ConstructSafePath(g_InputRootPath, rel).string();
+            std::string lower = full; AsciiLowerInplace(lower); // ★B5
+            std::vector<MeshSlot> meshes;
+            std::vector<ShapeBone> shapeBones;
+            auto it = nifMeshCache.find(lower);
+            if (it != nifMeshCache.end()) { meshes = it->second; shapeBones = nifBoneCache[lower]; }
+            else {
+                { std::lock_guard<std::mutex> lk(g_ProgressMutex); g_CurrentProcessItem = "Per-mesh: " + fs::path(full).filename().string(); }
+                if (PerMeshCache_Get(full, meshes, shapeBones)) ++cacheHit;
+                else { ReadNifPerMeshSlotsAndBones(full, meshes, shapeBones); PerMeshCache_Put(full, meshes, shapeBones); ++nifRead; }
+                nifMeshCache[lower] = meshes;
+                nifBoneCache[lower] = shapeBones;
+            }
+            // ★スキンボーン抽出: ボーン情報とスケルトン解決は meshes の有無に関わらず付与する
+            //   （リジッド/NiSkin のみの NIF でもボーンと unskinnedShapes を出す）。
+            rec.shapeBones = shapeBones;
+            ComputeBoneResolution(rec, skelSet, skelId, genderLabel);
+            if (meshes.empty()) continue; // NIF 読めない/static → union のみ（export フォールバック）
+            rec.meshes = meshes;
+            std::set<int> meshUnion; for (const auto& m : meshes) for (int s : m.slots) meshUnion.insert(s);
+            std::vector<int> arma = ParseSlotString(rec.armaSlots);
+            rec.blockingSlots.clear();
+            for (int s : arma) if (!meshUnion.count(s)) rec.blockingSlots.push_back(s);
+            ++withMesh;
+        }
+        PerMeshCache_Save();
+        AddLog("Convert: per-mesh recovered for " + std::to_string(withMesh) + "/" + std::to_string(total)
+            + " records (cache hit " + std::to_string(cacheHit) + ", read " + std::to_string(nifRead)
+            + "). Rows without a readable NIF are union-only.", LogType::Info);
+    }
+    catch (const std::exception& e) { AddLog(std::string("Convert: per-mesh phase error: ") + e.what() + " (writing union-only).", LogType::Error); }
+    catch (...) { AddLog("Convert: per-mesh phase unknown error (writing union-only).", LogType::Error); }
+
+    // ★衣装シード: トグル ON のとき、変換した全件 recs から costume_seed.json を出力（changeset とは独立）。
+    if (g_ExportCostumeSeed) {
+        try { WriteCostumeSeed(recs); }
+        catch (...) { AddLog("Convert: costume seed write error (skipped).", LogType::Warning); }
+    }
+
+    // 3) ChangeSet へ書き出し（既存があれば key 単位で merge。旧 txt はそのまま残す）。
+    WriteChangeSet(recs);
+    AddLog("Convert done -> slotdata-ChangeSet.json. (Legacy slotdata-Output.txt left untouched.)", LogType::Success);
+    }
+    catch (const std::exception& e) { AddLog(std::string("Convert worker error: ") + e.what(), LogType::Error); }
+    catch (...)                     { AddLog("Convert worker unknown error.", LogType::Error); }
 }
 
 // ★追加: メッシュ更新リクエスト用フラグ
@@ -517,11 +1206,12 @@ void UpdateMeshList(nifly::NifFile& targetNif, std::vector<RenderMesh>& outMeshe
 
 void LoadNifFileCore(const std::string& path) {
     g_HasPairedFile = false;
+    g_ConvertedNiSkinShapes.clear(); // ★別 NIF をロードしたら NiSkin 化指定をリセット
 
     // --- ★変更ここから★ ---
     // Mode 3: Bodyslide Source NIF (Direct Load)
     if (g_NifLoadMode == 3) {
-        if (g_NifData.Load(path) == 0) {
+        if (SafeNifLoad(g_NifData, fs::path(path)) == 0) {
             g_CurrentNifPath = path;
             //UpdateMeshList();
             g_RequestMeshUpdate = true;
@@ -544,7 +1234,7 @@ void LoadNifFileCore(const std::string& path) {
                 AddLog("Found: " + target.string(), LogType::Info);
             }
         }
-        if (g_NifData.Load(target.string()) == 0) {
+        if (SafeNifLoad(g_NifData, target) == 0) {
             g_CurrentNifPath = target;
             //UpdateMeshList();
             g_RequestMeshUpdate = true;
@@ -557,7 +1247,7 @@ void LoadNifFileCore(const std::string& path) {
     }
 
     // Mode 0 (Both) or 2 (Pair Only) - Try to load pair
-    if (g_NifData.Load(path) == 0) {
+    if (SafeNifLoad(g_NifData, fs::path(path)) == 0) {
         g_CurrentNifPath = path;
         //UpdateMeshList();
         g_RequestMeshUpdate = true;
@@ -575,10 +1265,13 @@ void LoadNifFileCore(const std::string& path) {
         if (!pairName.empty()) {
             fs::path pairPath = p.parent_path() / pairName;
             if (fs::exists(pairPath)) {
-                if (g_PairedNifData.Load(pairPath.string()) == 0) {
+                if (SafeNifLoad(g_PairedNifData, pairPath) == 0) {
                     g_HasPairedFile = true;
                     g_PairedNifPath = pairPath;
                     AddLog(" + Pair Loaded: " + pairPath.filename().string(), LogType::Info);
+                }
+                else {
+                    AddLog("Pair file exists but failed to load: " + pairPath.filename().string(), LogType::Warning);
                 }
             }
             else if (g_NifLoadMode == 2) {
@@ -592,96 +1285,54 @@ void LoadNifFileCore(const std::string& path) {
 }
 
 // フォルダからのロード (修正版: export -> output の順序保証)
-void LoadSlotDataFolder(const std::string& folderPath) {
-    if (!fs::exists(folderPath)) { AddLog("Folder not found: " + folderPath, LogType::Error); return; }
-
-    g_DisplayTree.clear();
-    g_AllRecords.clear();
-    g_RecordSelectionMap.clear(); // リロード時は選択状態もクリア（IDが変わる可能性があるため）
-
-    std::map<std::string, SlotRecord> uniqueRecords;
-
-    // --- ファイル解析用ヘルパー関数 (DRY原則) ---
-    auto ParseFile = [&](const fs::path& path) {
-        std::ifstream file(path);
-        std::string line;
-        int count = 0;
-        while (std::getline(file, line)) {
-            if (line.empty()) continue;
-            auto cols = SplitString(line, ';');
-            if (cols.size() >= 9) {
-                SlotRecord rec;
-                rec.sourceFile = cols[0];
-                rec.armaFormID = cols[1];
-                rec.armaEditorID = cols[2];
-                rec.armoFormID = cols[3];
-                rec.armoEditorID = cols[4];
-                rec.malePath = cols[5];
-                rec.femalePath = cols[6];
-                rec.armoSlots = cols[7];
-                rec.armaSlots = cols[8];
-
-                // 新: g_TargetGender に従って優先パスを決定（0=Male, 1=Female）
-                if (g_TargetGender == 0) { // Male 優先
-                    rec.nifPath = !rec.malePath.empty() ? rec.malePath : rec.femalePath;
-                }
-                else { // Female 優先
-                    rec.nifPath = !rec.femalePath.empty() ? rec.femalePath : rec.malePath;
-                }
-
-                // ここで male / female 両方から base key を生成して保持する
-                rec.baseNifKeyMale = rec.malePath.empty() ? "" : GetBaseNifKey(rec.malePath);
-                rec.baseNifKeyFemale = rec.femalePath.empty() ? "" : GetBaseNifKey(rec.femalePath);
-
-                // 既存の baseNifKey は後方互換で male 優先（従来の振る舞いを維持）
-                if (!rec.baseNifKeyMale.empty()) rec.baseNifKey = rec.baseNifKeyMale;
-                else rec.baseNifKey = rec.baseNifKeyFemale;
-
-                rec.displayText = rec.armaEditorID;
-
-                // ★ここで上書き発生: 同じEditorIDなら後勝ち
-                uniqueRecords[rec.armaEditorID] = rec;
-                count++;
-            }
-        }
-        return count;
-        };
-
-
-    AddLog("Loading Slot Data from: " + folderPath, LogType::Info);
-
-    // 1. まず "slotdata-Output.txt" 以外の全てのファイルを読み込む (export等)
-    int baseCount = 0;
-    for (const auto& entry : fs::directory_iterator(folderPath)) {
-        if (entry.path().extension() == ".txt") {
-            std::string fname = entry.path().filename().string();
-            // ファイル名比較 (大文字小文字を区別せず "slotdata-output.txt" を除外)
-            std::string lowerName = fname;
-            std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::tolower);
-
-            if (lowerName != "slotdata-output.txt") {
-                baseCount += ParseFile(entry.path());
-            }
+// ★バッチモード: slotdata-Output.txt を「ブラウズ DB」ではなく "pending" に読み込む。
+//   読み込み後、ユーザーが Pending パネルの統合 Export（NIF/ESL/txt）で一括生成する。
+//   esl は armaFormKey 空でも armaFormID+source から FormKey 再構成されるため動作する。
+void LoadSlotdataIntoPending() {
+    if (strlen(g_SlotDataPath) == 0) { AddLog("Batch: SlotData folder is not set (Settings).", LogType::Warning); return; }
+    // ★pending に既に何かあれば展開を中止（取り違え防止）。
+    {
+        std::lock_guard<std::recursive_mutex> lock(g_DataMutex);
+        if (!g_SessionChanges.empty()) {
+            AddLog("Batching Canceled: Pending is not empty (" + std::to_string(g_SessionChanges.size())
+                + " item(s)). Export or clear Pending first.", LogType::Warning);
+            return;
         }
     }
-    // AddLog("Base records loaded: " + std::to_string(baseCount));
-
-    // 2. 最後に "slotdata-Output.txt" を読み込んで上書きする (Override)
-    fs::path outPath = fs::path(folderPath) / "slotdata-Output.txt";
-    if (fs::exists(outPath)) {
-        int overrideCount = ParseFile(outPath);
-        AddLog("Applied overrides from slotdata-Output.txt (" + std::to_string(overrideCount) + " records).", LogType::Success);
-    }
-    else {
-        // 大文字小文字の違いで見つからない場合の保険
-        fs::path outPathLower = fs::path(folderPath) / "slotdata-output.txt";
-        if (fs::exists(outPathLower)) {
-            int overrideCount = ParseFile(outPathLower);
-            AddLog("Applied overrides from slotdata-output.txt (" + std::to_string(overrideCount) + " records).", LogType::Success);
-        }
+    // ★per-mesh: 旧 slotdata-Output.txt（union のみ）→ slotdata-ChangeSet.json（per-mesh meshes[] 込み）。
+    fs::path inP = fs::path(g_SlotDataPath) / CHANGESET_FILENAME;
+    if (!fs::exists(inP)) {
+        AddLog(std::string("Batch: ") + CHANGESET_FILENAME + " not found in " + std::string(g_SlotDataPath)
+            + ". (Old slotdata-Output.txt is no longer read in this version.)", LogType::Warning);
+        return;
     }
 
-    // マップからリスト・ツリーへ変換
+    std::map<std::string, SlotRecord> loadedMap;
+    int loaded = 0, skipped = 0;
+    if (!ReadChangeSet(loadedMap, loaded, skipped)) {
+        AddLog(std::string("Batch: failed to read ") + CHANGESET_FILENAME + ".", LogType::Error);
+        return;
+    }
+    {
+        std::lock_guard<std::recursive_mutex> lock(g_DataMutex);
+        for (auto& [k, r] : loadedMap) g_SessionChanges[k] = r;
+    }
+    // ★誤解防止: バッチ読込直後は出力チェック（NIF/ESL/txt）を外す。これらは「この
+    //   セッションで実際に編集した結果」ではないため、ユーザーが意図的に選び直してから Export させる。
+    g_ExportNif = false;
+    g_ExportEsl = false;
+    g_ExportTxt = false;
+
+    AddLog(std::string("Batch: loaded ") + std::to_string(loaded) + " record(s) into pending from " + CHANGESET_FILENAME
+        + (skipped ? (" (skipped " + std::to_string(skipped) + " malformed)") : "")
+        + ". Output checkboxes were cleared - tick NIF/ESL/txt deliberately, then press Export.", LogType::Success);
+}
+
+
+// ★Step3: uniqueRecords（armaEditorID -> SlotRecord）から g_AllRecords / g_DisplayTree /
+//   g_RecordSelectionMap を再構築する。txt ローダと JSON ローダの両方が使う共有処理。
+void BuildRecordsAndTree(std::map<std::string, SlotRecord>& uniqueRecords) {
+    ++g_DbVersion; // ★DB が作り直されたことを通知（フィルタキャッシュ無効化）
     int idCounter = 0;
     for (auto& [key, rec] : uniqueRecords) {
         rec.id = ++idCounter;
@@ -698,9 +1349,7 @@ void LoadSlotDataFolder(const std::string& folderPath) {
             g_DisplayTree[rec.sourceFile]["Male NIF"][mName].push_back(rec.id);
         }
     }
-
     g_SelectedRecordID = -1;
-    AddLog("Total records loaded: " + std::to_string(g_AllRecords.size()), LogType::Success);
 }
 
 //ApplySlotChanges　エリア
@@ -713,7 +1362,7 @@ bool PathEndsWith(const std::string& fullPath, const std::string& suffix) {
     std::string s1 = fullPath;
     std::string s2 = suffix;
     auto Normalize = [](std::string& s) {
-        std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+        AsciiLowerInplace(s); // ★B5
         std::replace(s.begin(), s.end(), '\\', '/');
         };
     Normalize(s1);
@@ -722,6 +1371,76 @@ bool PathEndsWith(const std::string& fullPath, const std::string& suffix) {
     if (s2.length() > s1.length()) return false;
     return s1.compare(s1.length() - s2.length(), s2.length(), s2) == 0;
 }
+
+// ★per-mesh 記録の共有: 現在表示中の g_RenderMeshes から meshes[] スナップショット（toNiSkin 反映）を作り、
+//   currentNif（＋OSP 出力候補）に一致する g_AllRecords を更新して g_SessionChanges に登録する。
+//   ApplySlotChanges（slot 編集後）と ConvertSelectedMeshToNiSkin（NiSkin 化後）が共用。
+//   armaSlots は union(非 NiSkin の slots) ∪ blockingSlots（NiSkin 化メッシュは union から除外＝ESP からも外れる）。
+// ★C26110/C26117 抑制: 本関数は g_DataMutex(recursive_mutex) を lock_guard で全スコープ RAII 保持しており
+//   早期 return も手動 unlock も無く正しい。だが SAL 並行性チェッカは recursive_mutex の再入を
+//   モデル化できず「保持されていないロックを解放」と誤検出するため、ここだけ抑制する（誤検出）。
+#pragma warning(push)
+#pragma warning(disable: 26110 26117)
+static void RecordCurrentMeshesToPending() {
+    std::vector<MeshSlot> meshSnapshot;
+    std::set<int> unionSet;
+    for (const auto& m : g_RenderMeshes) {
+        MeshSlot ms; ms.shapeIndex = m.shapeIndex; ms.name = m.name; ms.slots = m.activeSlots;
+        ms.toNiSkin = (g_ConvertedNiSkinShapes.count(m.shapeIndex) > 0);
+        if (ms.toNiSkin) ms.slots.clear();
+        meshSnapshot.push_back(ms);
+        if (!ms.toNiSkin) for (int sl : m.activeSlots) unionSet.insert(sl);
+    }
+
+    std::string currentNifPath = g_CurrentNifPath.string();
+    int updatedCount = 0;
+    {
+        // ★#1: g_OspFiles / g_AllRecords / g_SessionChanges への一連のアクセスを 1 ロックで保護。
+        //   （旧コードは g_OspFiles 反復をロック外で行っており、OSP ワーカーの挿入と競合し得た。）
+        std::lock_guard<std::recursive_mutex> lock(g_DataMutex);
+
+        std::vector<std::string> validGamePaths;
+        validGamePaths.push_back(currentNifPath);
+        for (const auto& [ospName, ospData] : g_OspFiles) {
+            for (const auto& set : ospData.sets) {
+                std::string sPath = set.sourceNifPath;
+                if (PathEndsWith(currentNifPath, fs::path(sPath).filename().string())) {
+                    fs::path outBase = fs::path(set.outputPath) / set.outputName;
+                    validGamePaths.push_back((outBase.string() + "_0.nif"));
+                    validGamePaths.push_back((outBase.string() + "_1.nif"));
+                    validGamePaths.push_back((outBase.string() + ".nif"));
+                }
+            }
+        }
+
+        for (auto& r : g_AllRecords) {
+            bool match = false, isOspMatch = false;
+            for (size_t i = 0; i < validGamePaths.size(); ++i) {
+                if (PathEndsWith(validGamePaths[i], r.malePath) || PathEndsWith(validGamePaths[i], r.femalePath)) {
+                    match = true; if (i > 0) isOspMatch = true; break;
+                }
+            }
+            if (!match) continue;
+            r.meshes = meshSnapshot;
+            std::set<int> armaSet = unionSet;
+            for (int b : r.blockingSlots) armaSet.insert(b);
+            std::string armaStr; { bool f2 = true; for (int sl : armaSet) { if (!f2) armaStr += ","; armaStr += std::to_string(sl); f2 = false; } }
+            r.armaSlots = armaStr; r.armoSlots = armaStr;
+            r.isOspSource = isOspMatch; r.originalNifPath = currentNifPath;
+            std::string key = r.sourceFile + "_" + r.armaFormID;
+            g_SessionChanges[key] = r;
+            updatedCount++;
+        }
+
+        if (updatedCount > 0) AddLog("Updated " + std::to_string(updatedCount) + " linked records in Pending List.", LogType::Info);
+        else {
+            AddLog("Note: Changes applied to NIF, but no linked ESP records found.", LogType::Warning);
+            AddLog("Debug: Searched for paths like: " + (validGamePaths.size() > 1 ? validGamePaths[1] : "None"), LogType::Info);
+        }
+    }
+}
+#pragma warning(pop)
+
 // スロット変更適用ロジック
 void ApplySlotChanges(int meshIndex, const std::string& slotStr) {
     if (meshIndex < 0 || meshIndex >= g_RenderMeshes.size()) return;
@@ -763,8 +1482,11 @@ void ApplySlotChanges(int meshIndex, const std::string& slotStr) {
                     return false;
                 }
 
-                for (size_t i = 0; i < writeCount; ++i) {
-                    dis->partitions[i].partID = (uint16_t)newSlots[i];
+                // ★SEH 保護: パーティション書込はアクセス違反でアプリ全体を落としうるため
+                //   __try ラッパー経由で行う（GetShapes/dynamic_cast は本ラムダ＝__try 外）。
+                if (!SafeWritePartitions(dis, newSlots.data(), (int)writeCount)) {
+                    AddLog(std::string("Apply crashed during partition write (skipped): ") + bs->name.get(), LogType::Error);
+                    return false;
                 }
 
                 if (newSlots.size() > writeCount) {
@@ -831,76 +1553,69 @@ void ApplySlotChanges(int meshIndex, const std::string& slotStr) {
         }
         // --- 即時UI反映ここまで ---
 
-        // --- Pending Save への登録ロジック ---
-        std::set<int> all;
-        for (const auto& m : g_RenderMeshes) for (int sl : m.activeSlots) all.insert(sl);
-        std::stringstream css; bool f = true; for (int sl : all) { if (!f)css << ","; css << sl; f = false; }
-        std::string newSlotStr = css.str();
-
-        std::string currentNifPath = g_CurrentNifPath.string();
-
-        // ★★★ OSPのOutputパスを事前計算 ★★★
-        std::vector<std::string> validGamePaths;
-        validGamePaths.push_back(currentNifPath);
-
-        for (const auto& [ospName, ospData] : g_OspFiles) {
-            for (const auto& set : ospData.sets) {
-                std::string sPath = set.sourceNifPath;
-                if (PathEndsWith(currentNifPath, fs::path(sPath).filename().string())) {
-                    fs::path outBase = fs::path(set.outputPath) / set.outputName;
-                    validGamePaths.push_back((outBase.string() + "_0.nif"));
-                    validGamePaths.push_back((outBase.string() + "_1.nif"));
-                    validGamePaths.push_back((outBase.string() + ".nif"));
-                }
-            }
-        }
-
-        int updatedCount = 0;
-        {
-            std::lock_guard<std::mutex> lock(g_DataMutex);
-
-            for (auto& r : g_AllRecords) {
-                bool match = false;
-                bool isOspMatch = false;
-
-                for (size_t i = 0; i < validGamePaths.size(); ++i) {
-                    if (PathEndsWith(validGamePaths[i], r.malePath) || PathEndsWith(validGamePaths[i], r.femalePath)) {
-                        match = true;
-                        if (i > 0) isOspMatch = true;
-                        break;
-                    }
-                }
-
-                if (match) {
-                    // ここで保存するスロットは「実際に書き込んだもののみ」にする
-                    r.armaSlots = newSlotStr;
-                    r.armoSlots = newSlotStr;
-
-                    if (isOspMatch) {
-                        r.isOspSource = true;
-                        r.originalNifPath = currentNifPath;
-                    }
-                    else {
-                        r.isOspSource = false;
-                        r.originalNifPath = currentNifPath;
-                    }
-
-                    std::string key = r.sourceFile + "_" + r.armaFormID;
-                    g_SessionChanges[key] = r;
-
-                    updatedCount++;
-                }
-            }
-        }
-
-        if (updatedCount > 0) {
-            AddLog("Updated " + std::to_string(updatedCount) + " linked records in Pending List.", LogType::Info);
-        }
-        else {
-            AddLog("Note: Changes applied to NIF, but no linked ESP records found.", LogType::Warning);
-            AddLog("Debug: Searched for paths like: " + (validGamePaths.size() > 1 ? validGamePaths[1] : "None"), LogType::Info);
-        }
+        // --- Pending Save への登録（per-mesh 記録 + 置換維持型 armaSlots）。共有関数に委譲。---
+        RecordCurrentMeshesToPending();
     }
+}
+
+// ★選択中メッシュを NiSkin 化（BSD→NiSkin）し、pending に記録する。
+//   g_NifData（＋ペア）を即変換して表示に反映し、g_ConvertedNiSkinShapes に shapeIndex を登録、
+//   その後 RecordCurrentMeshesToPending で ESP からもスロットを外して記録する。export 時に原本へ再適用される。
+void ConvertSelectedMeshToNiSkin() {
+    int sel = g_SelectedMeshIndex;
+    if (sel < 0 || sel >= (int)g_RenderMeshes.size()) { AddLog("Convert: no mesh selected.", LogType::Warning); return; }
+    auto& m = g_RenderMeshes[sel];
+    if (m.slotInfo == "NiSkin") { AddLog("Convert: '" + m.name + "' is already NiSkin.", LogType::Info); return; }
+    int shapeIdx = m.shapeIndex;
+
+    if (!ConvertShapeToNiSkin(g_NifData, shapeIdx)) {
+        AddLog("Convert to NiSkin failed (no BSDismemberSkinInstance?): " + m.name, LogType::Error);
+        return;
+    }
+    // ペアも同名 shape を変換
+    if (g_HasPairedFile) {
+        auto pShapes = g_PairedNifData.GetShapes();
+        for (size_t k = 0; k < pShapes.size(); ++k)
+            if (pShapes[k] && pShapes[k]->name.get() == m.name) { ConvertShapeToNiSkin(g_PairedNifData, (int)k); break; }
+    }
+
+    g_ConvertedNiSkinShapes.insert(shapeIdx);
+    // 即時 UI 反映（次フレームの再構築前に表示を NiSkin に）
+    m.slotInfo = "NiSkin"; m.activeSlots.clear();
+    AddLog("Converted to NiSkin: " + m.name + " (its slot is removed from the ESP too).", LogType::Success);
+
+    RecordCurrentMeshesToPending();
+    g_RequestMeshUpdate = true;
+}
+
+// ★選択中 NiSkin メッシュを BSD 化（既定 slot 32・1 パーティション）して pending に記録する。
+//   その後 per-partition エディタでスロットを編集できる。BSD→NiSkin の逆操作（連続テスト用）。
+void ConvertSelectedMeshToBSD() {
+    int sel = g_SelectedMeshIndex;
+    if (sel < 0 || sel >= (int)g_RenderMeshes.size()) { AddLog("Convert: no mesh selected.", LogType::Warning); return; }
+    auto& m = g_RenderMeshes[sel];
+    if (m.slotInfo != "NiSkin") { AddLog("Convert: '" + m.name + "' already has partitions (not NiSkin).", LogType::Info); return; }
+    int shapeIdx = m.shapeIndex;
+    const int defSlot = 32; // 既定 Body。変換後に per-partition エディタで変更可能。
+
+    if (!ConvertShapeToBSD(g_NifData, shapeIdx, defSlot)) {
+        AddLog("Convert to BSD failed: " + m.name, LogType::Error);
+        return;
+    }
+    if (g_HasPairedFile) {
+        auto pShapes = g_PairedNifData.GetShapes();
+        for (size_t k = 0; k < pShapes.size(); ++k)
+            if (pShapes[k] && pShapes[k]->name.get() == m.name) { ConvertShapeToBSD(g_PairedNifData, (int)k, defSlot); break; }
+    }
+
+    g_ConvertedNiSkinShapes.erase(shapeIdx); // NiSkin 指定を解除（再び BSD）
+    // 即時 UI 反映
+    m.slotInfo = std::to_string(defSlot);
+    m.activeSlots = { defSlot };
+    AddLog("Converted to BSD: " + m.name + " (1 partition, slot " + std::to_string(defSlot) + " - edit it below).", LogType::Success);
+
+    RecordCurrentMeshesToPending();
+    g_RequestMeshUpdate = true;
 }
 
 // ============================================================
@@ -908,119 +1623,397 @@ void ApplySlotChanges(int meshIndex, const std::string& slotStr) {
 // ============================================================
 
 void SaveSessionChangesToFile() {
+    // ★スレッド安全: g_SessionChanges の読み出し・clear を保護（detach ワーカーの erase/write と競合するため）。
+    //   呼び出し元（UI ボタン・ExportOSPWorker 末尾）はいずれも g_DataMutex 非保持なので再帰ロックにはならない。
+    std::lock_guard<std::recursive_mutex> lock(g_DataMutex);
     if (g_SessionChanges.empty()) return;
     if (strlen(g_SlotDataPath) == 0) return;
 
-    fs::create_directories(g_SlotDataPath);
-    fs::path outP = fs::path(g_SlotDataPath) / "slotdata-Output.txt";
-
-    // 1. 既存のファイルをすべてメモリに読み込む
-    std::vector<std::string> fileLines;
-    if (fs::exists(outP)) {
-        std::ifstream inFile(outP);
-        std::string line;
-        while (std::getline(inFile, line)) {
-            if (!line.empty()) {
-                // 行末の改行コード除去（念のため）
-                if (line.back() == '\r') line.pop_back();
-                fileLines.push_back(line);
-            }
-        }
-        inFile.close();
-    }
-
-    int updatedCount = 0;
-    int newCount = 0;
-
-    // ヘルパー: 行を再構築するラムダ関数
-    auto JoinLine = [](const std::vector<std::string>& tokens) {
-        std::string res;
-        for (size_t i = 0; i < tokens.size(); i++) {
-            res += tokens[i];
-            if (i < tokens.size() - 1) res += ";";
-        }
-        return res;
-        };
-
-    // 2. セッションの変更分を反映
-    for (const auto& pair : g_SessionChanges) {
-        const auto& newRec = pair.second;
-        bool found = false;
-
-        for (auto& line : fileLines) {
-            std::vector<std::string> tokens = SplitString(line, ';');
-
-            // データ破損などの不正行はスキップ
-            if (tokens.size() < 9) continue;
-
-            // 1～7カラム目 (Index 0～6) の一致確認
-            // sourceFile, armaFormID, armaEditorID, armoFormID, armoEditorID, malePath, femalePath
-            // 新: パス比較は正規化して大文字小文字を無視
-            auto norm = [](const std::string& s) { return NormalizePathForComparison(s); };
-
-            if (tokens[0] == newRec.sourceFile &&
-                tokens[1] == newRec.armaFormID &&
-                tokens[2] == newRec.armaEditorID &&
-                tokens[3] == newRec.armoFormID &&
-                tokens[4] == newRec.armoEditorID &&
-                norm(tokens[5]) == norm(newRec.malePath) &&
-                norm(tokens[6]) == norm(newRec.femalePath)) {
-
-                // 一致した場合：8カラム目と9カラム目 (Index 7, 8) を上書き
-                tokens[7] = newRec.armoSlots;
-                tokens[8] = newRec.armaSlots;
-
-                // 行を再構築して更新
-                line = JoinLine(tokens);
-
-                found = true;
-                updatedCount++;
-                break; // 1行見つかればOK
-            }
-        }
-
-        // 一致する行がなかった場合、新規行として追加
-        if (!found) {
-            std::stringstream ss;
-            ss << newRec.sourceFile << ";" << newRec.armaFormID << ";" << newRec.armaEditorID << ";"
-                << newRec.armoFormID << ";" << newRec.armoEditorID << ";"
-                << newRec.malePath << ";" << newRec.femalePath << ";"
-                << newRec.armoSlots << ";" << newRec.armaSlots;
-            fileLines.push_back(ss.str());
-            newCount++;
-        }
-    }
-
-    // 3. ファイルに書き戻し (上書きモード)
-    std::ofstream outFile(outP); // std::ios::app は指定しない
-    if (!outFile.is_open()) { AddLog("Write failed: " + outP.string(), LogType::Error); return; }
-
-    for (const auto& line : fileLines) {
-        outFile << line << "\n";
-    }
-    outFile.close();
-
+    // ★per-mesh: slotdata-ChangeSet.json に merge して書き出し、pending をクリアする。
+    //   （旧 9 列 txt 経路は撤去。union だけでなく meshes[]/blockingSlots も永続化される。）
+    WriteChangeSet(g_SessionChanges);
     g_SessionChanges.clear();
-
-    // ログ表示
-    std::string msg = "Saved: " + std::to_string(updatedCount) + " updated, " + std::to_string(newCount) + " new.";
-    AddLog(msg, LogType::Success);
 }
 // =========================================================================
 // 統合エクスポートワーカー (Text保存 + NIF一括出力)
 // =========================================================================
 // --- 変更: SaveAndExportAllWorker の ExportSingleNif の戻り値を bool にして成功分のみ保存する ---
-void SaveAndExportAllWorker() {
+// ★NIF 出力の結果分類。Duplicate / NoPartition は「成功扱い」（pending クリア対象）だが
+//   内訳として別カウントする。Mismatch は手動チェック要（pending に残す）。Failed は真の失敗。
+enum class NifExportStatus { Exported, DupSkip, NoPartition, PendingOnly, Mismatch, Failed };
+
+// ★バッチ堅牢化: nifly の Load/Save をSEH(__try/__except)でラップ。特定 NIF での
+//   アクセス違反（C++ try/catch では捕捉不能なネイティブ例外）でアプリ全体が落ちるのを防ぎ、
+//   その NIF をスキップして継続させる。__try を使うため、これらの関数フレームには
+//   デストラクタを要する C++ ローカルを置かない（C2712 回避）。引数は参照で受ける。
+// ★B2: SEH（アクセス違反等）専用の最内ラッパ。C++ 例外（bad_alloc 等）はここでは捕捉しない。
+//   /EHsc では __except が C++ 例外をすり抜けるため、C++ try/catch は外側ラッパに置く。
+//   __try を含む関数にはデストラクタを要する C++ 局所を置けない（C2712）ので分離している。
+static int SafeNifLoadSEH(nifly::NifFile& nif, const fs::path& p) {
+    __try { return nif.Load(p); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -9999; }
+}
+static bool SafeNifSaveSEH(nifly::NifFile& nif, const fs::path& p) {
+    __try { nif.Save(p); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// ★B6: 破損 NIF がヘッダで巨大なブロック数/頂点数を主張すると nifly が巨大 vector を確保し bad_alloc。
+//   読込前にファイルサイズ上限で弾く（通常の装備 NIF は数十 MB 以内。余裕をみて 512MB を上限）。
+static const uintmax_t kMaxNifBytes = 512ull * 1024 * 1024;
+
+// ★B2/A1: SEH に加えて C++ 例外（bad_alloc 等）も捕捉する外側ラッパ。
+//   これにより detach ワーカーだけでなく UI スレッド経路（LoadNifFileCore/LoadReferenceBody 等）でも
+//   破損 NIF による std::terminate を防げる。戻り値: 0=成功、非0=失敗（負値）。
+static int SafeNifLoad(nifly::NifFile& nif, const fs::path& p) {
+    std::error_code ec;
+    uintmax_t sz = fs::file_size(p, ec);
+    if (!ec && sz > kMaxNifBytes) {
+        AddLog("NIF too large, refusing to load (" + std::to_string(sz) + " bytes): " + p.string(), LogType::Error);
+        return -9998;
+    }
+    try { return SafeNifLoadSEH(nif, p); }
+    catch (const std::exception& e) { AddLog(std::string("NIF load exception: ") + e.what() + " (" + p.string() + ")", LogType::Error); return -9997; }
+    catch (...) { AddLog("NIF load unknown exception (" + p.string() + ")", LogType::Error); return -9996; }
+}
+static bool SafeNifSave(nifly::NifFile& nif, const fs::path& p) {
+    try { return SafeNifSaveSEH(nif, p); }
+    catch (const std::exception& e) { AddLog(std::string("NIF save exception: ") + e.what() + " (" + p.string() + ")", LogType::Error); return false; }
+    catch (...) { AddLog("NIF save unknown exception (" + p.string() + ")", LogType::Error); return false; }
+}
+
+// ★単発ロード系SEH: パーティション書込（GetShapes 等の C++ 一時を持たない生ポインタ操作のみ）を
+//   __try で保護する。失敗（アクセス違反）で false。呼び出し側は GetShapes/dynamic_cast を __try の
+//   外（通常 C++）で行い、得た dis ポインタと slot 配列だけを渡すこと（C2712 回避のため本関数内に
+//   デストラクタを要する C++ ローカルを置かない）。
+#ifdef _WIN32
+static bool SafeWritePartitions(nifly::BSDismemberSkinInstance* dis, const int* slots, int count) {
+    __try {
+        for (int i = 0; i < count; ++i) dis->partitions[i].partID = (uint16_t)slots[i];
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+#else
+static bool SafeWritePartitions(nifly::BSDismemberSkinInstance* dis, const int* slots, int count) {
+    for (int i = 0; i < count; ++i) dis->partitions[i].partID = (uint16_t)slots[i];
+    return true;
+}
+#endif
+
+// ★per-mesh: NIF を読み、shape 毎の BSDismemberSkinInstance パーティション slot を取得する。
+//   ScanNifSlotsWorker の内ループと同要領。shapeIndex は GetShapes() の並び順。
+//   GetShapes() 等は SafeNifLoad の __try 外（通常 C++）で行う。dismember を1つでも持てば true。
+// ★スキンボーン抽出: meshes[]（BSD のみ・従来挙動）と shapeBones（全 shape を網羅）を NIF 1 回読みで構築する。
+//   - bones は nifly の GetShapeBoneList（NiSkin/BSD を問わず参照ボーン NiNode 名を返す）で取得。厳密一致・大小区別を保持。
+//   - skeletonRoot は skin instance（NiSkinInstance 派生＝BSD 含む）の targetRef → NiNode 名。取得不可なら空。
+//   - skin instance を持たないリジッド shape は hasSkin=false / bones=[]（利用側で変形しない＝区別が要る）。
+//   GetShapes()/dynamic_cast は SafeNifLoad の __try 外（通常 C++）で行う。dismember を1つでも持てば true。
+bool ReadNifPerMeshSlotsAndBones(const std::string& nifFullPath, std::vector<MeshSlot>& outMeshes,
+                                 std::vector<ShapeBone>& outShapeBones) {
+    outMeshes.clear();
+    outShapeBones.clear();
+    nifly::NifFile nif;
+    if (SafeNifLoad(nif, fs::path(nifFullPath)) != 0) return false;
+    bool hadDismember = false;
+    auto shapes = nif.GetShapes();
+    for (size_t k = 0; k < shapes.size(); ++k) {
+        auto* shape = shapes[k];
+        if (!shape) continue;
+
+        // --- 全 shape を網羅する ShapeBone ---
+        ShapeBone sb;
+        sb.shapeIndex = (int)k;
+        sb.name = shape->name.get();
+        sb.hasSkin = shape->HasSkinInstance();
+        if (sb.hasSkin) {
+            // 参照ボーン名（NiSkin/BSD 共通）。nifly が boneRefs → NiNode 名を解決する。
+            nif.GetShapeBoneList(shape, sb.bones);
+            // ★エッジケース 6-1: skin instance はあるが Bones が空/null → hasSkin=true のまま bones=[] で残し、警告。
+            //   利用側の解決判定で「スキンドなのにボーン 0＝アタッチできない」を検出できるようにする。
+            if (sb.bones.empty())
+                AddLog("Bone extract: shape '" + sb.name + "' has a skin instance but no bones (hasSkin=true, bones=[]): "
+                    + fs::path(nifFullPath).filename().string(), LogType::Warning);
+            // Skeleton Root（診断用）: skin instance の targetRef → NiNode 名。
+            auto* skinRef = shape->SkinInstanceRef();
+            if (skinRef && !skinRef->IsEmpty()) {
+                auto* skin = nif.GetHeader().GetBlock<nifly::NiSkinInstance>(skinRef->index);
+                if (skin) {
+                    auto* root = nif.GetHeader().GetBlock<nifly::NiNode>(skin->targetRef.index);
+                    if (root) sb.skeletonRoot = root->name.get();
+                }
+            }
+        }
+        outShapeBones.push_back(std::move(sb));
+
+        // --- meshes[]（BSD のみ・従来どおり。export のパーティション書込キー） ---
+        auto* bs = dynamic_cast<nifly::BSTriShape*>(shape);
+        if (!bs) continue;
+        auto skinRef = bs->SkinInstanceRef();
+        if (skinRef->IsEmpty()) continue;
+        auto skin = nif.GetHeader().GetBlock<nifly::NiObject>(skinRef->index);
+        auto dis = dynamic_cast<nifly::BSDismemberSkinInstance*>(skin);
+        if (!dis) continue;
+        hadDismember = true;
+        MeshSlot ms;
+        ms.shapeIndex = (int)k;
+        ms.name = bs->name.get();
+        for (const auto& p : dis->partitions) ms.slots.push_back((int)p.partID);
+        outMeshes.push_back(std::move(ms));
+    }
+    return hadDismember;
+}
+
+// 従来シグネチャ（ボーン不要の呼び出し用）。ボーンは捨てる薄いラッパー。
+bool ReadNifPerMeshSlots(const std::string& nifFullPath, std::vector<MeshSlot>& outMeshes) {
+    std::vector<ShapeBone> dummy;
+    return ReadNifPerMeshSlotsAndBones(nifFullPath, outMeshes, dummy);
+}
+
+// ★スケルトン解決パス: ';' 区切りのスケルトン NIF パス列を読み、全 NiNode 名を outNames に集める。
+//   各パスは ConstructSafePath（InputRoot 相対）→ 絶対パス（そのまま）の順で解決を試みる。
+//   いずれか1つでも NIF が読めれば true。outResolvedId に実際に読めたパスを ';' 連結で返す。
+bool BuildSkeletonBoneSet(const std::string& semicolonPaths, std::set<std::string>& outNames,
+                          std::string& outResolvedId) {
+    outNames.clear();
+    outResolvedId.clear();
+    if (semicolonPaths.empty()) return false;
+    bool anyLoaded = false;
+    std::stringstream ss(semicolonPaths);
+    std::string one;
+    while (std::getline(ss, one, ';')) {
+        // 前後空白を除去
+        size_t a = one.find_first_not_of(" \t");
+        size_t b = one.find_last_not_of(" \t");
+        if (a == std::string::npos) continue;
+        std::string rel = one.substr(a, b - a + 1);
+        if (rel.empty()) continue;
+
+        // 候補パス: そのまま（絶対）／InputRoot 相対の両方を試す。
+        std::vector<fs::path> candidates;
+        candidates.push_back(fs::path(rel));
+        if (strlen(g_InputRootPath) > 0) candidates.push_back(ConstructSafePath(g_InputRootPath, rel));
+
+        nifly::NifFile skelNif;
+        bool loaded = false;
+        std::string usedPath;
+        for (const auto& c : candidates) {
+            std::error_code ec;
+            if (!fs::exists(c, ec)) continue;
+            if (SafeNifLoad(skelNif, c) == 0) { loaded = true; usedPath = c.string(); break; }
+        }
+        if (!loaded) {
+            AddLog("Skeleton resolve: could not read '" + rel + "' (tried direct + InputRoot-relative).", LogType::Warning);
+            continue;
+        }
+        anyLoaded = true;
+        if (!outResolvedId.empty()) outResolvedId += ";";
+        outResolvedId += usedPath;
+        // 全 NiNode 名を集合へ（厳密一致・大小区別を保持）。
+        for (auto* node : skelNif.GetNodes()) {
+            if (!node) continue;
+            std::string nm = node->name.get();
+            if (!nm.empty()) outNames.insert(nm);
+        }
+    }
+    return anyLoaded;
+}
+
+// ★スケルトン解決パス: rec.shapeBones を boneSet に対し判定して rec.boneRes を埋める。
+//   skeletonId 空（スケルトン未指定/読込不可）→ resolved=null（note に理由）＋ボーン抽出自体は維持。
+void ComputeBoneResolution(SlotRecord& rec, const std::set<std::string>& boneSet,
+                           const std::string& skeletonId, const std::string& genderLabel) {
+    BoneResolution& br = rec.boneRes;
+    br = BoneResolution{};
+    br.computed = true;
+    br.gender = genderLabel;
+    br.skeleton = skeletonId;
+
+    // 未スキン（リジッド）シェイプ名を収集（変形しない＝利用側で区別が要る）。
+    for (const auto& sb : rec.shapeBones)
+        if (!sb.hasSkin) br.unskinnedShapes.push_back(sb.name);
+
+    if (skeletonId.empty() || boneSet.empty()) {
+        br.resolved = -1; // null
+        br.note = "skeleton not configured or unreadable; bones extracted but not resolved";
+        return;
+    }
+
+    // 全スキンドシェイプの全ボーンが boneSet に存在するか。欠落は和集合で。
+    std::set<std::string> missing;
+    for (const auto& sb : rec.shapeBones) {
+        if (!sb.hasSkin) continue;
+        for (const auto& bn : sb.bones)
+            if (!boneSet.count(bn)) missing.insert(bn);
+    }
+    br.missingBones.assign(missing.begin(), missing.end());
+    br.resolved = missing.empty() ? 1 : 0;
+}
+
+// ★Force Overwrite: 上書き前にオリジナルを .bak へ退避する（既存 .bak は保持＝最初の1回だけ作る）。
+static void BackupFileOnce(const fs::path& target) {
+    std::error_code ec;
+    if (!fs::exists(target, ec)) return;
+    fs::path bak = target; bak += ".bak";
+    if (fs::exists(bak, ec)) return; // 既存 .bak は pristine として保持
+    fs::copy_file(target, bak, ec);
+    if (!ec) { if (LogVerbose()) AddLog("Backup: " + bak.string(), LogType::Info); }
+    else AddLog("Backup failed (" + bak.string() + "): " + ec.message(), LogType::Warning);
+}
+
+// ★BSD→NiSkin: 指定 shape の BSDismemberSkinInstance を NiSkinInstance に置換する。
+//   新規 NiSkinInstance に bone/data/skinPartition/target を引き継ぎ、AddBlock→shape を付け替え→旧 BSD を DeleteBlock。
+//   nifly の DeleteBlock が全参照番号を補正する。BSD でなければ（既に NiSkin 等）false。
+bool ConvertShapeToNiSkin(nifly::NifFile& nif, int shapeIndex) {
+    try {
+        auto shapes = nif.GetShapes();
+        if (shapeIndex < 0 || shapeIndex >= (int)shapes.size()) return false;
+        auto* bs = dynamic_cast<nifly::BSTriShape*>(shapes[shapeIndex]);
+        if (!bs) return false;
+        auto* skinRef = bs->SkinInstanceRef();
+        if (!skinRef || skinRef->IsEmpty()) return false;
+        uint32_t oldIdx = skinRef->index;
+        auto* skin = nif.GetHeader().GetBlock<nifly::NiObject>(oldIdx);
+        auto* bsd = dynamic_cast<nifly::BSDismemberSkinInstance*>(skin);
+        if (!bsd) return false; // BSD でない（NiSkin/別型）→ 変換不要/不可
+
+        auto newSkin = std::make_unique<nifly::NiSkinInstance>();
+        newSkin->boneRefs = bsd->boneRefs;                 // ボーン一覧（NiBoneContainer）
+        newSkin->dataRef = bsd->dataRef;                   // NiSkinData
+        newSkin->skinPartitionRef = bsd->skinPartitionRef; // NiSkinPartition（ジオメトリ側・無傷）
+        newSkin->targetRef = bsd->targetRef;               // skeleton root
+
+        uint32_t newIdx = nif.GetHeader().AddBlock(std::move(newSkin));
+        skinRef->index = newIdx;            // shape を新 NiSkinInstance へ
+        nif.GetHeader().DeleteBlock(oldIdx); // 旧 BSD を削除（参照番号は nifly が自動補正）
+        return true;
+    }
+    catch (...) { return false; }
+}
+
+// ★NiSkin→BSD: 指定 shape を BSDismemberSkinInstance に変換し、全三角形を1パーティション（slot）に割当てる。
+//   nifly の SetShapePartitions(convertSkinInstance=true) が NiSkinInstance を BSD に変換してくれる。
+bool ConvertShapeToBSD(nifly::NifFile& nif, int shapeIndex, int slot) {
+    try {
+        auto shapes = nif.GetShapes();
+        if (shapeIndex < 0 || shapeIndex >= (int)shapes.size()) return false;
+        auto* shape = shapes[shapeIndex];
+        if (!shape) return false;
+
+        nifly::NiVector<nifly::BSDismemberSkinInstance::PartitionInfo> partInfo;
+        nifly::BSDismemberSkinInstance::PartitionInfo pi;
+        pi.flags = (nifly::PartitionFlags)(nifly::PF_EDITOR_VISIBLE | nifly::PF_START_NET_BONESET);
+        pi.partID = (uint16_t)slot;
+        partInfo.push_back(pi);
+
+        uint32_t triCount = shape->GetNumTriangles();
+        std::vector<int> triParts((size_t)triCount, 0); // 全三角形を partition 0 へ
+        nif.SetShapePartitions(shape, partInfo, triParts, true); // convertSkinInstance=true
+        return true;
+    }
+    catch (...) { return false; }
+}
+
+// ★#4 共有: 読み込み済み NIF に rec の per-mesh（無ければ armaSlots=union）スロットを適用する。
+//   ExportSingleNif（Pending 統合 Export）と ExportOSPWorker（OSP 出力）の両方が使い、per-mesh /
+//   toNiSkin / NiSkin↔BSD 変換と SEH 保護（SafeWritePartitions）を一貫させる。
+//   戻り値 = 何か書込/変換したか。outMismatch = slots が partition 数を超過 or 書込中クラッシュ
+//   （いずれも呼び出し側は「保存中止＝手動チェック要」として扱う）。
+bool ApplyPerMeshSlotsToNif(nifly::NifFile& nif, const SlotRecord& rec, bool& outMismatch) {
+    outMismatch = false;
+    std::vector<int> unionSlots = ParseSlotString(rec.armaSlots); // フォールバック（meshes 空のレコード用）
+    bool usePerMesh = !rec.meshes.empty();
+    bool anyWritten = false;
+
+    auto iequals = [](const std::string& a, const std::string& b) {
+        if (a.size() != b.size()) return false;
+        return std::equal(a.begin(), a.end(), b.begin(),
+            [](char x, char y) { return ::tolower((unsigned char)x) == ::tolower((unsigned char)y); });
+    };
+
+    if (!usePerMesh && unionSlots.empty()) return false;
+
+    auto shapes = nif.GetShapes();
+    for (size_t k = 0; k < shapes.size(); ++k) {
+        auto bs = dynamic_cast<nifly::BSTriShape*>(shapes[k]);
+        if (!bs) continue;
+        std::string meshName = bs->name.get();
+
+        // この shape に書く slots（per-mesh: shapeIndex 主・name 副 / フォールバック: union）。
+        std::vector<int> slotsForShape;
+        if (usePerMesh) {
+            const MeshSlot* ms = nullptr;
+            for (const auto& m : rec.meshes) if (m.shapeIndex == (int)k) { ms = &m; break; }
+            if (!ms) for (const auto& m : rec.meshes) if (iequals(m.name, meshName)) { ms = &m; break; }
+            if (!ms) { if (LogVerbose()) AddLog("  no per-mesh entry for shape: " + meshName + " (left as-is)", LogType::Info); continue; }
+            // ★BSD→NiSkin: フラグ付き shape は NiSkin へ変換（スロット書込はしない）。
+            if (ms->toNiSkin) {
+                if (ConvertShapeToNiSkin(nif, (int)k)) { anyWritten = true; if (LogVerbose()) AddLog("  converted to NiSkin: " + meshName, LogType::Info); }
+                else AddLog("  NiSkin convert skipped (not BSD?): " + meshName, LogType::Warning);
+                continue;
+            }
+            slotsForShape = ms->slots;
+        }
+        else {
+            slotsForShape = unionSlots;
+        }
+        if (slotsForShape.empty()) continue;
+
+        auto skinRef = bs->SkinInstanceRef();
+        if (skinRef->IsEmpty()) { if (LogVerbose()) AddLog("  mesh has no SkinInstanceRef: " + meshName, LogType::Info); continue; }
+        auto skin = nif.GetHeader().GetBlock<nifly::NiObject>(skinRef->index);
+        if (!skin) { if (LogVerbose()) AddLog("  skin block null for: " + meshName, LogType::Warning); continue; }
+        auto dis = dynamic_cast<nifly::BSDismemberSkinInstance*>(skin);
+        if (!dis) {
+            // ★元が NiSkin で per-mesh スロット指定あり → NiSkin→BSD 変換（スロットは変換時に付与）。
+            if (usePerMesh && !slotsForShape.empty()) {
+                if (ConvertShapeToBSD(nif, (int)k, slotsForShape[0])) {
+                    anyWritten = true;
+                    if (LogVerbose()) AddLog("  converted NiSkin->BSD (slot " + std::to_string(slotsForShape[0]) + "): " + meshName, LogType::Info);
+                }
+                else AddLog("  NiSkin->BSD convert failed: " + meshName, LogType::Warning);
+            }
+            else if (LogVerbose()) AddLog("  not a BSDismemberSkinInstance: " + meshName, LogType::Info);
+            continue;
+        }
+
+        size_t partCount = dis->partitions.size();
+        if (LogVerbose()) AddLog("  partitions: " + std::to_string(partCount) + ", slots: " + std::to_string(slotsForShape.size()) + " on '" + meshName + "'", LogType::Info);
+        // ★⑤ 保険 mismatch: per-mesh slots がその shape の partition 数を超える場合のみ。
+        if (slotsForShape.size() > partCount) {
+            AddLog("  SLOT MISMATCH: slots(" + std::to_string(slotsForShape.size()) + ") > NIF partitions(" + std::to_string(partCount) + ") on mesh '" + meshName + "'", LogType::Error);
+            outMismatch = true;
+            return anyWritten;
+        }
+        int writeCount = (int)std::min(partCount, slotsForShape.size());
+        if (writeCount > 0) {
+            if (SafeWritePartitions(dis, slotsForShape.data(), writeCount)) anyWritten = true;
+            else { AddLog("  crash during partition write (skipped file): " + meshName, LogType::Error); outMismatch = true; return anyWritten; }
+        }
+    }
+    return anyWritten;
+}
+
+void SaveAndExportAllWorker(bool doNif, bool doEsl, bool doTxt) {
     g_IsProcessing = true;
     g_CancelRequested = false;
     g_Progress = 0.0f;
+    // ★A1: detach ワーカーから C++ 例外が抜けると std::terminate。本体全体を try/catch で囲い、
+    //   いずれの脱出経路でも g_IsProcessing を下ろす（Guard）。
+    struct Guard { ~Guard() { g_IsProcessing = false; } } _seGuard;
+    try {
 
-    AddLog("Starting Save & Export All...", LogType::Info);
+    if (!doNif && !doEsl && !doTxt) {
+        AddLog("Export: nothing selected (NIF/ESL/txt all off).", LogType::Warning);
+        g_IsProcessing = false;
+        return;
+    }
+    AddLog(std::string("Starting Export: ") + (doNif ? "NIF " : "") + (doEsl ? "ESL " : "") + (doTxt ? "txt" : ""), LogType::Info);
 
     // 1. pending をコピー
     std::map<std::string, SlotRecord> pendingCopy;
     {
-        std::lock_guard<std::mutex> lock(g_DataMutex);
+        std::lock_guard<std::recursive_mutex> lock(g_DataMutex);
         pendingCopy = g_SessionChanges;
     }
 
@@ -1031,29 +2024,36 @@ void SaveAndExportAllWorker() {
     }
 
     // 2. NIF出力 -> 成功したレコードのみ後で保存する
-    int success = 0;
-    int fail = 0;
+    int success = 0;   // 実書き出し成功 + pendingOnly
+    int dupSkip = 0;   // 同 NIF を別レコードが出力済み（成功扱い）
+    int noPart = 0;    // パーティション無し NiSkin/静的（成功扱い）
+    int mismatch = 0;  // パーティション数不一致（手動チェック要・pending 残す）
+    int fail = 0;      // 真の失敗（ロード/保存失敗・例外）
     int current = 0;
     int total = (int)pendingCopy.size();
 
     std::set<std::string> processedPaths;
     std::set<std::string> successfulKeys; // 保存対象キー
 
-    // ExportSingleNif: inPathを基にNIFを出力し、成功なら true を返す。
-    // ただし rec.pendingOnly == true の場合は「NIF は変更しないが成功扱い」として true を返す（slotdata 書き出し対象とする）。
-    auto ExportSingleNif = [&](const std::string& inPathStr, const SlotRecord& rec, bool isOsp, const std::string& recKey) -> bool {
+    // ExportSingleNif: inPath を基に NIF を出力し、結果ステータスを返す。
+    //   Duplicate（同 NIF を別レコードが出力済み）/ NoPartition（NiSkin 等）/ PendingOnly は成功扱い。
+    auto ExportSingleNif = [&](const std::string& inPathStr, const SlotRecord& rec, bool isOsp, const std::string& recKey) -> NifExportStatus {
          fs::path inPath(inPathStr);
          std::string lowerPath = inPath.generic_string();
-         std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), ::tolower);
+         AsciiLowerInplace(lowerPath); // ★B5: 重複出力検出キー（パス）
 
         if (processedPaths.count(lowerPath)) {
-             AddLog("Skipping duplicate path: " + inPath.string(), LogType::Info);
-             return false;
+             if (LogVerbose()) AddLog("Skipping duplicate path (already exported by sibling record): " + inPath.string(), LogType::Info);
+             return NifExportStatus::DupSkip;
          }
          processedPaths.insert(lowerPath);
 
          fs::path outPath;
-         if (strlen(g_OutputRootPath) > 0) {
+         if (g_ForceOverwrite) {
+             // ★Force Overwrite: Output Root を無視し、オリジナル（入力 NIF）に直接上書き（.bak は保存直前に作る）。
+             outPath = inPath;
+         }
+         else if (strlen(g_OutputRootPath) > 0) {
              fs::path outRoot(g_OutputRootPath);
              if (isOsp) {
                  fs::path rel = GetPathFromFolder(inPath, "shapedata");
@@ -1076,84 +2076,62 @@ void SaveAndExportAllWorker() {
          try {
             // pendingOnly の場合は NIF 書き込みを行わず成功扱い（slotdata への反映対象にする）
             if (rec.pendingOnly) {
-                AddLog("ExportSingleNif: pendingOnly record, skipping NIF write but marking as success for: " + inPath.string(), LogType::Info);
-                return true;
+                if (LogVerbose()) AddLog("pendingOnly record (no NIF write), marked success: " + inPath.string(), LogType::Info);
+                return NifExportStatus::PendingOnly;
             }
 
              if (outPath.has_parent_path()) fs::create_directories(outPath.parent_path());
 
-             AddLog("ExportSingleNif: in=" + inPath.string() + " out=" + outPath.string() + " slots=" + rec.armaSlots, LogType::Info);
+             if (LogVerbose()) AddLog("ExportSingleNif: in=" + inPath.string() + " out=" + outPath.string() + " slots=" + rec.armaSlots, LogType::Info);
 
              nifly::NifFile nif;
-             if (nif.Load(inPath.string()) == 0) {
-                 AddLog("Loaded NIF: " + inPath.string(), LogType::Info);
-                 std::vector<int> newSlots = ParseSlotString(rec.armaSlots);
-                 bool anyWritten = false;
+             if (SafeNifLoad(nif, inPath) == 0) {
+                 if (LogVerbose()) AddLog("Loaded NIF: " + inPath.string(), LogType::Info);
+                 // ★#4: per-mesh / union 適用は共有関数に一本化（OSP 経路と同一ロジック・SEH 保護）。
                  bool skipFile = false;
+                 bool anyWritten = ApplyPerMeshSlotsToNif(nif, rec, skipFile);
 
-                 if (!newSlots.empty()) {
-                     auto shapes = nif.GetShapes();
-                     for (auto s : shapes) {
-                         if (auto bs = dynamic_cast<nifly::BSTriShape*>(s)) {
-                             std::string meshName = bs->name.get();
-                             AddLog(" Processing mesh: " + meshName, LogType::Info);
-                             auto skinRef = bs->SkinInstanceRef();
-                             if (skinRef->IsEmpty()) {
-                                 AddLog("  mesh has no SkinInstanceRef: " + meshName, LogType::Info);
-                                 continue;
-                             }
-                             auto skin = nif.GetHeader().GetBlock<nifly::NiObject>(skinRef->index);
-                             if (!skin) { AddLog("  skin block null for: " + meshName, LogType::Warning); continue; }
-                             if (auto dis = dynamic_cast<nifly::BSDismemberSkinInstance*>(skin)) {
-                                 size_t partCount = dis->partitions.size();
-                                 AddLog("  partitions: " + std::to_string(partCount) + ", newSlots: " + std::to_string(newSlots.size()), LogType::Info);
-                                 if (newSlots.size() > partCount) {
-                                     AddLog("  SKIP: newSlots(" + std::to_string(newSlots.size()) + ") > partitions(" + std::to_string(partCount) + ") for " + meshName, LogType::Warning);
-                                     skipFile = true;
-                                     break;
-                                 }
-                                 for (size_t i = 0; i < partCount && i < newSlots.size(); ++i) {
-                                     dis->partitions[i].partID = (uint16_t)newSlots[i];
-                                     anyWritten = true;
-                                 }
-                             }
-                             else {
-                                 AddLog("  not a BSDismemberSkinInstance: " + meshName, LogType::Info);
-                             }
-                         }
-                     }
-                 }
-
-                if (!skipFile && anyWritten) {
-                    nif.Save(outPath.string());
-                    AddLog(std::string("Exported (NIF) -> ") + outPath.string(), LogType::Success);
-                    return true;
+                // ★分類は skipFile を最優先で判定する（旧: !anyWritten を先に見ていたため、
+                //   最初のメッシュで mismatch すると anyWritten=false で NoPartition に誤分類され、
+                //   MANUAL CHECK が出なかった）。
+                if (skipFile) {
+                    // パーティション数不一致 → 強調＋手動チェック要（NIF は書かない）。
+                    AddLog("==> SLOT MISMATCH, MANUAL CHECK REQUIRED: " + inPath.string()
+                        + " (DB slot count exceeds NIF partitions; NOT written)", LogType::Error);
+                    return NifExportStatus::Mismatch;
                 }
-                else if (!anyWritten) {
-                    AddLog("No partitions written for: " + inPath.string(), LogType::Warning);
-                    return false;
+                else if (anyWritten) {
+                    if (g_ForceOverwrite) BackupFileOnce(outPath); // ★上書き前にオリジナルを退避
+                    if (SafeNifSave(nif, outPath)) {
+                        AddLog(std::string("Exported (NIF) -> ") + outPath.string(), LogType::Success);
+                        return NifExportStatus::Exported;
+                    }
+                    AddLog("Crash/exception during NIF save (skipped): " + outPath.string(), LogType::Error);
+                    return NifExportStatus::Failed;
                 }
                 else {
-                    AddLog("Skipped export due to partition mismatch: " + inPath.string(), LogType::Warning);
-                    return false;
+                    // パーティション無し（NiSkin/静的）。スロット編集対象外なので成功扱い（ESL/txt は別途出る）。
+                    AddLog("No partitions (NiSkin/static), nothing to write: " + inPath.string(), LogType::Info);
+                    return NifExportStatus::NoPartition;
                 }
              }
              else {
-                 AddLog("Skipping: source is not a binary NIF, and .osp/text output is disabled: " + inPath.string(), LogType::Warning);
-                 return false;
+                 AddLog("Skipping: source is not a binary NIF or failed to load: " + inPath.string(), LogType::Warning);
+                 return NifExportStatus::Failed;
              }
          }
          catch (const std::exception& ex) {
              AddLog(std::string("Export exception for ") + inPath.string() + ": " + ex.what(), LogType::Error);
-             return false;
+             return NifExportStatus::Failed;
          }
          catch (...) {
              AddLog(std::string("Unknown export exception for ") + inPath.string(), LogType::Error);
-             return false;
+             return NifExportStatus::Failed;
          }
          };
 
-    // メインループ
+    // メインループ（NIF 出力は doNif のときのみ。for 全体が if の対象）
+    if (doNif)
     for (const auto& [key, rec] : pendingCopy) {
         if (g_CancelRequested) break;
         current++;
@@ -1168,17 +2146,23 @@ void SaveAndExportAllWorker() {
         if (targetPath.empty()) continue;
 
         // rec を渡して pendingOnly フラグを参照できるようにする
-        bool ok = ExportSingleNif(targetPath, rec, rec.isOspSource, key);
-        if (ok) {
-            success++;
-            successfulKeys.insert(key);
+        NifExportStatus st = ExportSingleNif(targetPath, rec, rec.isOspSource, key);
+        // 成功扱い（Exported/PendingOnly/DupSkip/NoPartition）→ カウント＋クリア対象。
+        // Mismatch/Failed → pending に残す。
+        bool handledOk = false;
+        switch (st) {
+        case NifExportStatus::Exported:    success++;  handledOk = true; break;
+        case NifExportStatus::PendingOnly: success++;  handledOk = true; break;
+        case NifExportStatus::DupSkip:     dupSkip++;  handledOk = true; break;
+        case NifExportStatus::NoPartition: noPart++;   handledOk = true; break;
+        case NifExportStatus::Mismatch:    mismatch++; break;
+        case NifExportStatus::Failed:      fail++;     break;
         }
-        else {
-            fail++;
-        }
+        if (handledOk) successfulKeys.insert(key);
 
-        // ペアファイルの自動検出とエクスポート (OSPでない場合のみ)
-        if (ok && !rec.isOspSource) {
+        // ペアファイルの自動検出とエクスポート (OSPでない場合のみ)。
+        //   ペアが Mismatch/Failed のときだけ警告（dup/noPart は正常）。
+        if (handledOk && !rec.isOspSource) {
             fs::path p(targetPath);
             std::string stem = p.stem().string();
             std::string ext = p.extension().string();
@@ -1190,257 +2174,168 @@ void SaveAndExportAllWorker() {
             if (!pairName.empty()) {
                 fs::path pairPath = p.parent_path() / pairName;
                 if (fs::exists(pairPath)) {
-                    // ペアは isOsp=false で呼ぶ（rec の isOspSource フラグに依存しない）
-                    bool pairOk = ExportSingleNif(pairPath.string(), rec, false, key);
-                    if (!pairOk) {
-                        // ペアが失敗した場合は key の扱いは慎重に: ここでは成功集合に残すがログを出す
+                    NifExportStatus pst = ExportSingleNif(pairPath.string(), rec, false, key);
+                    if (pst == NifExportStatus::Mismatch)
+                        AddLog("==> Pair SLOT MISMATCH, MANUAL CHECK: " + pairPath.string(), LogType::Error);
+                    else if (pst == NifExportStatus::Failed)
                         AddLog("Pair export failed for: " + pairPath.string(), LogType::Warning);
-                    }
                 }
             }
         }
     }
 
-    // 成功したレコードのみを保存する
-    if (!successfulKeys.empty()) {
-        std::map<std::string, SlotRecord> toSave;
-        for (const auto& k : successfulKeys) {
-            if (pendingCopy.count(k)) toSave[k] = pendingCopy[k];
-        }
-        if (!toSave.empty()) {
-            SaveSessionChangesToFileFiltered(toSave);
-        }
+    // ★統合 Export: 選択された出力を実行し、成功分の pending をクリアする。
+    //   NIF 成否集合: doNif なら成功キー、!doNif なら全 pending を「NIF OK」扱い。
+    std::set<std::string> nifOkKeys;
+    if (doNif) nifOkKeys = successfulKeys;
+    else for (const auto& [k, rec] : pendingCopy) { (void)rec; nifOkKeys.insert(k); }
+
+    // txt: slotdata-Output.txt を更新（スロット決定の記録。NIF 成否に依らず全 pending を書く）。
+    if (doTxt && !g_CancelRequested) {
+        SaveSessionChangesToFileFiltered(pendingCopy);
     }
 
-    if (!g_CancelRequested) {
-        AddLog("Export All: " + std::to_string(success) + " files saved. Failed: " + std::to_string(fail), LogType::Success);
+    // esl: override-only ESL パッチを生成（全 pending・all-or-nothing）。
+    bool eslOk = true;
+    if (doEsl && !g_CancelRequested) {
+        eslOk = RunSlotPatchImport(pendingCopy);
     }
-    else {
+
+    // クリア: キャンセルされず、(esl 未選択 or esl 成功) のとき、NIF が OK だったレコードを除去。
+    //   NIF 失敗分は再試行できるよう pending に残す。
+    if (!g_CancelRequested && (!doEsl || eslOk)) {
+        int cleared = 0;
+        {
+            std::lock_guard<std::recursive_mutex> lock(g_DataMutex);
+            for (const auto& [k, rec] : pendingCopy) {
+                (void)rec;
+                if (nifOkKeys.count(k) && g_SessionChanges.count(k)) { g_SessionChanges.erase(k); ++cleared; }
+            }
+        }
+        // NIF 成功計上 = 実書き出し + 重複スキップ + パーティション無し。
+        int nifOkTotal = success + dupSkip + noPart;
+        AddLog("Export done. "
+            + std::string(doNif ? ("NIF ok=" + std::to_string(nifOkTotal)
+                + " (written=" + std::to_string(success)
+                + ", skip-dup=" + std::to_string(dupSkip)
+                + ", no-partition=" + std::to_string(noPart) + ")"
+                + ", fail=" + std::to_string(fail) + " ") : "")
+            + (doEsl ? std::string("| ESL=") + (eslOk ? "ok " : "FAIL ") : "")
+            + (doTxt ? "| txt-updated " : "")
+            + "| cleared " + std::to_string(cleared) + " pending.", LogType::Success);
+        // mismatch は強調して別出力（手動チェックを促す）。
+        if (doNif && mismatch > 0)
+            AddLog("*** " + std::to_string(mismatch) + " NIF(s) had a SLOT MISMATCH and were NOT written. "
+                "Check them MANUALLY (search 'SLOT MISMATCH' in the log). They remain in pending. ***", LogType::Error);
+    }
+    else if (g_CancelRequested) {
         AddLog("Export Cancelled.", LogType::Warning);
     }
+    else {
+        AddLog("Export: ESL generation FAILED; pending kept for retry (NIF/txt may already be written).", LogType::Warning);
+    }
     g_IsProcessing = false;
+    }
+    catch (const std::exception& e) { AddLog(std::string("Export worker error: ") + e.what(), LogType::Error); }
+    catch (...)                     { AddLog("Export worker unknown error.", LogType::Error); }
 }
 
 
-// BATCH EXPORT LOGIC (最適化版: 自動保存 + 性別優先 + 重複スキップ)
-// --- [Step 4] ExecuteBatchExport の置き換え (Worker関数) ---
-
-// 重い処理を行う実体
-void BatchExportWorker() {
+// =========================================================================
+// ★#2: DB slot vs NIF パーティション slot の不一致スキャン
+//   全 DB レコードの NIF を読み、BSDismemberSkinInstance のパーティション partID 集合と
+//   DB の armaSlots を比較。異なれば mismatch。NiSkin（dismember 無し）は除外。
+//   NIF ロードは path 単位でキャッシュ（男女・カラバリで共有 NIF を再読込しない）。
+// =========================================================================
+void ScanNifSlotsWorker() {
     g_IsProcessing = true;
     g_CancelRequested = false;
     g_Progress = 0.0f;
+    // ★A1: ワーカー全体を try/catch で囲い、いずれの脱出でも g_IsProcessing を下ろす。
+    struct Guard { ~Guard() { g_IsProcessing = false; } } _seGuard;
+    try {
+    AddLog("Scanning NIF partition slots vs DB slots...", LogType::Info);
 
-    AddLog("Starting Batch Export...", LogType::Info);
-
-    int successCount = 0;
-    int failCount = 0;
-
-    // 重複防止用セット (正規化されたパスを記録)
-    std::set<std::string> processedNifs;
-
-    // 処理対象の総数を概算（プログレスバー用）
-    // 正確にはNIF数ですが、レコード数で代用しても大きな問題はありません
-    int totalRecords = 0;
-    for (auto const& [id, selected] : g_RecordSelectionMap) {
-        if (selected) totalRecords++;
+    // レコードのスナップショット（id, armaSlots, male/female path）。
+    std::vector<SlotRecord> recs;
+    {
+        std::lock_guard<std::recursive_mutex> lock(g_DataMutex);
+        recs = g_AllRecords;
     }
 
-    int currentCount = 0;
+    // path -> (hasDismember, slots)。NIF ロード結果のキャッシュ。
+    std::map<std::string, std::pair<bool, std::set<int>>> nifCache;
+    std::set<int> mismatches;
+    int total = (int)recs.size();
+    int cur = 0, scanned = 0, skippedNoPath = 0, skippedNoLoad = 0, niSkin = 0;
 
-    for (const auto& record : g_AllRecords) {
+    for (const auto& r : recs) {
         if (g_CancelRequested) break;
+        ++cur;
+        g_Progress = total > 0 ? (float)cur / (float)total : 1.0f;
 
-        // 選択されていないレコードはスキップ
-        if (g_RecordSelectionMap.find(record.id) == g_RecordSelectionMap.end() || !g_RecordSelectionMap[record.id]) {
-            continue;
+        // 性別優先で NIF パスを解決（DB 表示と同じ規則）。
+        std::string rel = (g_TargetGender == 0) ? r.malePath : r.femalePath;
+        if (rel.empty()) rel = (g_TargetGender == 0) ? r.femalePath : r.malePath;
+        if (rel.empty() && !r.originalNifPath.empty()) rel = r.originalNifPath;
+        if (rel.empty()) { ++skippedNoPath; continue; }
+        std::string full = ConstructSafePath(g_InputRootPath, rel).string();
+
+        bool hasDis = false;
+        std::set<int> nifSlots;
+        auto it = nifCache.find(full);
+        if (it != nifCache.end()) {
+            hasDis = it->second.first;
+            nifSlots = it->second.second;
         }
-
-        currentCount++;
-        g_Progress = (float)currentCount / (float)(totalRecords > 0 ? totalRecords : 1);
-
-        // ターゲットのパスを決定 (性別設定に従う)
-        std::string targetPath = (g_TargetGender == 0) ? record.malePath : record.femalePath;
-        // 片方しかない場合のフォールバック
-        if (targetPath.empty()) targetPath = (g_TargetGender == 0) ? record.femalePath : record.malePath;
-
-        if (targetPath.empty()) continue;
-
-        // パスの正規化 (重複チェック用)
-        fs::path fullPath = ConstructSafePath(g_InputRootPath, targetPath);
-        std::string fullPathStr = fullPath.string();
-        std::string lowerPath = fullPathStr;
-        std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), ::tolower);
-
-        // ★★★ 修正ポイント: 既に処理済みのNIFならスキップ ★★★
-        if (processedNifs.count(lowerPath)) {
-            continue;
-        }
-        processedNifs.insert(lowerPath);
-        // ★★★★★★★★★★★★★★★★★★★★★★★★★★★
-
-        {
-            std::lock_guard<std::mutex> lock(g_ProgressMutex);
-            g_CurrentProcessItem = "Exporting: " + fullPath.filename().string();
-        }
-
-        // ファイル存在チェック
-        if (!fs::exists(fullPath)) {
-            AddLog("File not found: " + fullPathStr, LogType::Error);
-            failCount++;
-            continue;
-        }
-
-        // NIFロード & スロット適用 & 保存
-        try {
+        else {
             nifly::NifFile nif;
-            if (nif.Load(fullPathStr) == 0) {
-                bool modified = false;
-                auto shapes = nif.GetShapes();
-
-                // 適用するスロット情報 (現在のレコードの ARMA Slots を使用)
-                std::vector<int> newSlots = ParseSlotString(record.armaSlots);
-
-                if (!newSlots.empty()) {
-                    for (auto shape : shapes) {
-                        auto bs = dynamic_cast<nifly::BSTriShape*>(shape);
-                        if (!bs) continue;
-
-                        auto skinRef = bs->SkinInstanceRef();
-                        if (!skinRef->IsEmpty()) {
-                            auto skin = nif.GetHeader().GetBlock<nifly::NiObject>(skinRef->index);
-                            if (auto dis = dynamic_cast<nifly::BSDismemberSkinInstance*>(skin)) {
-                                // パーティション書き換え
-                                for (size_t i = 0; i < dis->partitions.size(); ++i) {
-                                    if (i < newSlots.size()) {
-                                        if (dis->partitions[i].partID != (uint16_t)newSlots[i]) {
-                                            dis->partitions[i].partID = (uint16_t)newSlots[i];
-                                            modified = true;
-                                        }
-                                    }
-                                }
-                            }
-                        }
+            if (SafeNifLoad(nif, fs::path(full)) == 0) {
+                for (auto* s : nif.GetShapes()) {
+                    auto* bs = dynamic_cast<nifly::BSTriShape*>(s);
+                    if (!bs) continue;
+                    auto skinRef = bs->SkinInstanceRef();
+                    if (skinRef->IsEmpty()) continue;
+                    auto skin = nif.GetHeader().GetBlock<nifly::NiObject>(skinRef->index);
+                    if (auto dis = dynamic_cast<nifly::BSDismemberSkinInstance*>(skin)) {
+                        hasDis = true;
+                        for (const auto& p : dis->partitions) nifSlots.insert((int)p.partID);
                     }
                 }
-
-                // 保存 (変更がなくても、「出力ボタンを押した＝NIFを再生成したい」意図とみなし保存する)
-                // ※出力先ルート設定がある場合はそちらへ、なければ上書き
-                fs::path outPath = fullPath;
-                if (strlen(g_OutputRootPath) > 0) {
-                    std::string fullStr = fullPath.string();
-                    std::string lowerStr = fullStr;
-                    std::transform(lowerStr.begin(), lowerStr.end(), lowerStr.begin(), ::tolower);
-
-                    // パスの中に "meshes" が含まれているか探す
-                    size_t pos = lowerStr.find("meshes");
-                    if (pos != std::string::npos) {
-                        // "meshes" 以降を切り出す (例: "meshes/armor/cuirass.nif")
-                        std::string relPath = fullStr.substr(pos);
-                        outPath = fs::path(g_OutputRootPath) / relPath;
-                    }
-                    else {
-                        // "meshes" が見つからない場合は OutputRoot/meshes 直下に置く
-                        outPath = fs::path(g_OutputRootPath) / "meshes" / fullPath.filename();
-                    }
-
-                    // 出力先フォルダがない場合は作成
-                    if (outPath.has_parent_path()) {
-                        fs::create_directories(outPath.parent_path());
-                    }
-                }
-
-                nif.Save(outPath.string());
-                successCount++;
             }
-            else {
-                AddLog("Failed to load NIF: " + fullPathStr, LogType::Error);
-                failCount++;
-            }
+            else { ++skippedNoLoad; }
+            nifCache[full] = { hasDis, nifSlots };
         }
-        catch (const std::exception& e) {
-            AddLog("Exception exporting " + fullPath.filename().string() + ": " + e.what(), LogType::Error);
-            failCount++;
-        }
+
+        if (!hasDis) { ++niSkin; continue; } // NiSkin / パーティション無し → 判定対象外
+
+        std::vector<int> dbV = ParseSlotString(r.armaSlots);
+        std::set<int> dbSlots(dbV.begin(), dbV.end());
+        if (dbSlots.empty()) continue; // DB 側にスロット情報が無い → 比較不能（ノイズ回避のため除外）
+        ++scanned;
+        // ★per-mesh モデル: armaSlots はブロックスロット（ジオメトリ無し）を含みうるので、
+        //   「完全一致」では恒常的に mismatch になる。真の不整合は「NIF パーティション slot が
+        //   armaSlots に含まれない」場合（= ESP が宣言していない geometry slot が NIF にある）。
+        bool realMismatch = false;
+        for (int s : nifSlots) if (!dbSlots.count(s)) { realMismatch = true; break; }
+        if (realMismatch) mismatches.insert(r.id);
     }
 
-    if (!g_CancelRequested) {
-        AddLog("Batch Export Completed. Success: " + std::to_string(successCount) + ", Failed: " + std::to_string(failCount), LogType::Success);
+    {
+        std::lock_guard<std::recursive_mutex> lock(g_DataMutex);
+        g_SlotMismatchRecords.swap(mismatches);
     }
-    else {
-        AddLog("Batch Export Cancelled.", LogType::Warning);
-    }
-
+    AddLog("Slot scan done: " + std::to_string((int)g_SlotMismatchRecords.size()) + " mismatch(es) of "
+        + std::to_string(scanned) + " checked (NiSkin skipped: " + std::to_string(niSkin)
+        + ", no-path: " + std::to_string(skippedNoPath) + ", load-fail: " + std::to_string(skippedNoLoad) + ").",
+        LogType::Success);
     g_IsProcessing = false;
+    }
+    catch (const std::exception& e) { AddLog(std::string("Scan worker error: ") + e.what(), LogType::Error); }
+    catch (...)                     { AddLog("Scan worker unknown error.", LogType::Error); }
 }
 
 
-// --- ExecuteSourceNifExport を fs::copy_file による単純コピーへ変更 ---
-extern void ExecuteSourceNifExport() {
-    if (strlen(g_OutputRootPath) == 0) {
-        AddLog("Output Root is not set!", LogType::Error);
-        return;
-    }
-    fs::path inBase = fs::path(g_GameDataPath) / "CalienteTools" / "BodySlide" / "ShapeData";
-    if (!fs::exists(inBase) && strlen(g_InputRootPath) > 0) {
-        fs::path try1 = fs::path(g_InputRootPath) / "CalienteTools" / "BodySlide" / "ShapeData";
-        if (fs::exists(try1)) inBase = try1;
-        else {
-            fs::path try2 = fs::path(g_InputRootPath).parent_path() / "CalienteTools" / "BodySlide" / "ShapeData";
-            if (fs::exists(try2)) inBase = try2;
-        }
-    }
-
-    if (!fs::exists(inBase)) {
-        AddLog("Source folder not found, cannot export.", LogType::Error);
-        return;
-    }
-
-    int count = 0;
-    int failCount = 0;
-
-    for (const auto& [key, selected] : g_SourceSelectionMap) {
-        if (!selected) continue;
-
-        size_t lastSlash = key.find_last_of('/');
-        if (lastSlash == std::string::npos) continue;
-
-        std::string folderRel = key.substr(0, lastSlash);
-        std::string fileName = key.substr(lastSlash + 1);
-
-        fs::path inPath = inBase / folderRel / fileName;
-        fs::path outDir = fs::path(g_OutputRootPath) / "CalienteTools" / "BodySlide" / "ShapeData" / folderRel;
-        fs::path outPath = outDir / fileName;
-
-        if (fs::exists(inPath)) {
-            try {
-                fs::create_directories(outDir);
-                // テキストの .osp 等は単純コピーで十分。nifly で開く必要はない。
-                fs::copy_file(inPath, outPath, fs::copy_options::overwrite_existing);
-                count++;
-            }
-            catch (const std::exception& ex) {
-                AddLog(std::string("Exception during copy: ") + ex.what(), LogType::Error);
-                failCount++;
-            }
-            catch (...) {
-                AddLog("Exception during export: " + fileName, LogType::Error);
-                failCount++;
-            }
-        }
-        else {
-            AddLog("Input file missing: " + fileName, LogType::Warning);
-        }
-    }
-
-    if (count > 0 || failCount > 0) {
-        AddLog("Source Export: " + std::to_string(count) + " success, " + std::to_string(failCount) + " failed.",
-            (failCount == 0 ? LogType::Success : LogType::Warning));
-    }
-    else {
-        AddLog("No files selected for export.", LogType::Info);
-    }
-}
 
 // ============================================================
 // メインGUI・ループ
@@ -1452,7 +2347,7 @@ int main(int, char**) {
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-    GLFWwindow* window = glfwCreateWindow(1600, 900, "Nif Slot Sniper v1.0.0", nullptr, nullptr);
+    GLFWwindow* window = glfwCreateWindow(1600, 900, "Nif Slot Sniper v2.0.0 (per-mesh)", nullptr, nullptr);
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1);
     gladLoadGLLoader((GLADloadproc)glfwGetProcAddress);
@@ -1463,7 +2358,12 @@ int main(int, char**) {
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
-    io.IniFilename = "imgui.ini";
+    // ★#6: imgui.ini も実行ファイルのディレクトリ基準（CWD 非依存）。静的に保持して寿命を確保。
+    static std::string s_imguiIniPath = AppPath("imgui.ini");
+    io.IniFilename = s_imguiIniPath.c_str();
+    // ★コンテンツ部のドラッグでウィンドウが動くのを防ぐ（タイトルバーからのみ移動）。
+    //   3D Viewport 上でのドラッグがウィンドウ移動になる問題への対策も兼ねる。
+    io.ConfigWindowsMoveFromTitleBarOnly = true;
 
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init(glsl_version);
@@ -1476,17 +2376,23 @@ int main(int, char**) {
         g_RequestInitialSetup = true;
     }
 
-    SlotDictionary::LoadRules();
-    SlotDictionary::InitDefaultComboRules();
+    SlotDictionary::LoadRules(); // ★修正: コンボのデフォルトは LoadRules 内で「空のときのみ」適用する
 
-    if (strlen(g_SlotDataPath) > 0 && fs::exists(g_SlotDataPath)) {
-        LoadSlotDataFolder(g_SlotDataPath);
+    AddLog("===== NifSlotSniper session start =====", LogType::Info);
+    // ★旧版の起動時 slotdata 自動読込は撤去（DB は「Import DB (slottool)」で構築する）。
+    //   slotdata-Output.txt はバッチ蓄積として残し、「Load slotdata → Pending」で読み込む。
+    AddLog("DB is empty. Use 'Import DB (slottool)' to load the current load order.", LogType::Info);
+
+    // ★#5: 記憶した参照ボディを起動時に自動読込（表示は OFF のまま。Show Ref で出す）。
+    if (strlen(g_RefBodyPath) > 0 && fs::exists(g_RefBodyPath)) {
+        LoadReferenceBody(g_RefBodyPath);
     }
 
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
 
-        if (!ImGui::GetIO().WantCaptureMouse) {
+        // ★3D Viewport にマウスがある時だけカメラ操作を受け付ける（背景全画面ではなくパネル基準）
+        if (g_ViewportHovered) {
             // ★追加: window変数が見つからないエラーへの確実な対策
             GLFWwindow* window = glfwGetCurrentContext();
 
@@ -1518,6 +2424,26 @@ int main(int, char**) {
             // ここでもwindowが必要なため取得 (念のため)
             GLFWwindow* window = glfwGetCurrentContext();
             glfwGetCursorPos(window, &g_LastMouseX, &g_LastMouseY);
+        }
+
+        // ★A: バックグラウンド Import DB の結果をメインスレッドで適用（構造変更は描画と非競合に）
+        if (g_ImportResultReady.load()) {
+            std::map<std::string, SlotRecord> result;
+            {
+                std::lock_guard<std::recursive_mutex> lk(g_DataMutex);
+                g_ImportResult.swap(result);
+            }
+            // ★スレッド安全: g_AllRecords/g_DisplayTree/g_RecordSelectionMap の作り直しは
+            //   detach ワーカー（BatchExport/Scan/OSP）の読みと競合するため g_DataMutex 下で行う。
+            {
+                std::lock_guard<std::recursive_mutex> lk(g_DataMutex);
+                g_DisplayTree.clear();
+                g_AllRecords.clear();
+                g_RecordSelectionMap.clear();
+                BuildRecordsAndTree(result);
+            }
+            g_ImportResultReady = false;
+            AddLog("DB applied: " + std::to_string(g_AllRecords.size()) + " records via slottool.", LogType::Success);
         }
 
         ImGui_ImplOpenGL3_NewFrame();
@@ -1565,11 +2491,29 @@ int main(int, char**) {
             ImGui::EndPopup();
         }
 
-        // --- Camera Info Overlay ---
-        ImGui::SetNextWindowPos(ImVec2(ImGui::GetIO().DisplaySize.x * 0.5f - 200, 25), ImGuiCond_Always);
-        ImGui::SetNextWindowBgAlpha(0.3f);
-        ImGui::Begin("CamInfo", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoInputs);
-        ImGui::Text("Camera: L-Click=Rotate | Shift+L-Click=Pan | Space=Reset");
+        // --- 3D Viewport（FBO をパネル内に表示。拡縮等の入力はこのパネルにスコープ） ---
+        {
+            ImVec2 _p, _s; GetMainPanelRect(MainPanel::Viewport, _p, _s);
+            ImGui::SetNextWindowPos(_p, ImGuiCond_Always);
+            ImGui::SetNextWindowSize(_s, ImGuiCond_Always);
+        }
+        ImGui::Begin("3D Viewport", nullptr, PIN_PANEL_FLAGS);
+        ImGui::TextDisabled("L-Click=Rotate | Shift+L-Click=Pan | Wheel=Zoom | Space=Reset");
+        ImVec2 viewAvail = ImGui::GetContentRegionAvail();
+        g_PanelW = (int)viewAvail.x;
+        g_PanelH = (int)viewAvail.y;
+        if (g_ViewColor)
+            ImGui::Image((ImTextureID)(intptr_t)g_ViewColor, viewAvail, ImVec2(0, 1), ImVec2(1, 0)); // V反転
+        g_ViewportHovered = (g_ViewColor != 0) && ImGui::IsItemHovered();
+        // ホイールズーム（Viewport 上のときのみ）— これが従来効かなかったズームの修正点
+        if (g_ViewportHovered) {
+            float wheel = ImGui::GetIO().MouseWheel;
+            if (wheel != 0.0f) {
+                g_CamDistance *= (1.0f - wheel * 0.1f);
+                if (g_CamDistance < 1.0f) g_CamDistance = 1.0f;
+                if (g_CamDistance > 5000.0f) g_CamDistance = 5000.0f;
+            }
+        }
         ImGui::End();
 
         // =========================================================
@@ -1603,9 +2547,10 @@ int main(int, char**) {
         // ログウィンドウ (短いのでここにあってもOKですが、必要なら分離可)
         // ---------------------------------------------------------
         {
-            ImGui::SetNextWindowPos(ImVec2(10, 720), ImGuiCond_FirstUseEver);
-            ImGui::SetNextWindowSize(ImVec2(760, 170), ImGuiCond_FirstUseEver);
-            ImGui::Begin("Log Console");
+            ImVec2 _p, _s; GetMainPanelRect(MainPanel::LogConsole, _p, _s);
+            ImGui::SetNextWindowPos(_p, ImGuiCond_Always);
+            ImGui::SetNextWindowSize(_s, ImGuiCond_Always);
+            ImGui::Begin("Log Console", nullptr, PIN_PANEL_FLAGS);
             if (ImGui::Button("Clear")) g_LogHistory.clear();
             ImGui::SameLine(); ImGui::Checkbox("Auto Scroll", &g_LogAutoScroll);
             ImGui::BeginChild("LogR", ImVec2(0, 0), false, ImGuiWindowFlags_HorizontalScrollbar);
@@ -1636,31 +2581,34 @@ int main(int, char**) {
         ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
 
         if (ImGui::BeginPopupModal("Processing", NULL, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoTitleBar)) {
+            bool cancelable = g_ProcessCancelable.load();
             ImGui::Text("Processing... Please Wait");
             ImGui::Separator();
-            ImGui::TextWrapped("Cancel stops after the current file finishes. "
-                "Please wait for the ongoing export to complete.");
 
-            // プログレスバー
-            ImGui::ProgressBar(g_Progress, ImVec2(300, 20));
-
-            // 現在の処理対象を表示 (排他制御)
+            // 現在の処理対象を表示 (排他制御)。BSA/Import はここに具体名が出る。
             {
                 std::lock_guard<std::mutex> lock(g_ProgressMutex);
                 ImGui::TextWrapped("%s", g_CurrentProcessItem.c_str());
             }
 
+            // プログレスバー。キャンセル不可（BSA/Import 等の不定長）はアニメーション表示。
+            double _t = ImGui::GetTime();
+            float frac = cancelable ? g_Progress.load() : (float)(_t - (double)(long long)_t);
+            ImGui::ProgressBar(frac, ImVec2(300, 20), cancelable ? nullptr : "working...");
+
             ImGui::Spacing();
             ImGui::Separator();
 
-            // キャンセルボタン
-            if (ImGui::Button("Cancel", ImVec2(120, 0))) {
-                g_CancelRequested = true;
-                // ボタンを押したら即座に「キャンセル中...」に変えると親切
-                {
+            // キャンセルボタン（可能な処理のみ）
+            if (cancelable) {
+                if (ImGui::Button("Cancel", ImVec2(120, 0))) {
+                    g_CancelRequested = true;
                     std::lock_guard<std::mutex> lock(g_ProgressMutex);
                     g_CurrentProcessItem = "Canceling...";
                 }
+            }
+            else {
+                ImGui::TextDisabled("This operation cannot be canceled.");
             }
 
             // 処理が終わったら閉じる
@@ -1672,14 +2620,17 @@ int main(int, char**) {
         }
         // --- Rendering ---
         ImGui::Render();
-        int dw, dh; glfwGetFramebufferSize(window, &dw, &dh);
-        glViewport(0, 0, dw, dh);
+
+        // ★3D を Viewport FBO に描画（パネル内寸）。既定FBではなくオフスクリーンへ。
+        EnsureViewportFBO(g_PanelW, g_PanelH);
+        glBindFramebuffer(GL_FRAMEBUFFER, g_ViewFBO);
+        glViewport(0, 0, g_ViewW, g_ViewH);
         glClearColor(clear_color.x, clear_color.y, clear_color.z, clear_color.w);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
         glUseProgram(g_ShaderProgram); // ★シェーダーを有効化
 
-        // --- Projection & View 行列 (変更なし) ---
-        glm::mat4 proj = glm::perspective(glm::radians(45.0f), (float)dw / dh, 0.1f, 10000.0f);
+        // --- Projection & View 行列 (アスペクトは Viewport パネル基準) ---
+        glm::mat4 proj = glm::perspective(glm::radians(45.0f), (float)g_ViewW / (float)g_ViewH, 0.1f, 10000.0f);
         glm::mat4 view = glm::translate(glm::mat4(1.0f), glm::vec3(g_CamOffset.x, g_CamOffset.y, -g_CamDistance));
 
         // --- Model 行列と中心点の決定 ---
@@ -1721,44 +2672,188 @@ int main(int, char**) {
         glUniformMatrix4fv(glGetUniformLocation(g_ShaderProgram, "view"), 1, GL_FALSE, glm::value_ptr(view));
         glUniformMatrix4fv(glGetUniformLocation(g_ShaderProgram, "model"), 1, GL_FALSE, glm::value_ptr(model));
         glUniform3f(glGetUniformLocation(g_ShaderProgram, "lightDir"), 0.5f, 1.0f, 0.3f);
+        // ★Tier3: sampler を unit0 に、ブレンド関数を設定
+        glUniform1i(glGetUniformLocation(g_ShaderProgram, "diffuseTex"), 0);
+        // ★#3: 法線マップ sampler は unit1。カメラのワールド座標を viewPos に渡す（スペキュラ用）。
+        glUniform1i(glGetUniformLocation(g_ShaderProgram, "normalTex"), 1);
+        glm::vec3 camWorldPos = glm::vec3(glm::inverse(view)[3]);
+        glUniform3f(glGetUniformLocation(g_ShaderProgram, "viewPos"), camWorldPos.x, camWorldPos.y, camWorldPos.z);
+        // ★#3-debug: 法線マップ基底の切替を毎フレーム反映。
+        glUniform1i(glGetUniformLocation(g_ShaderProgram, "nmFlipGreen"), g_NmFlipGreen ? 1 : 0);
+        glUniform1i(glGetUniformLocation(g_ShaderProgram, "nmFlipHand"), g_NmFlipHand ? 1 : 0);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
-        // 1. リファレンスボディの描画 (if文で囲まれている)
-        if (g_ShowRef && !g_RefRenderMeshes.empty()) {
-            // 補正計算ブロックを全削除し、これだけにする
-            for (const auto& m : g_RefRenderMeshes) {
-                glUniform3f(glGetUniformLocation(g_ShaderProgram, "objectColor"), m.color.r, m.color.g, m.color.b);
-                glBindVertexArray(m.VAO); glDrawElements(GL_TRIANGLES, (GLsizei)m.indexCount, GL_UNSIGNED_INT, 0);
-            }
-        }
+        // （描画は下の「★A1: 透過2パス」に統一。ref/main を不透明→半透明の順で描く。）
 
-        // 2. ★ここが重要！通常のメッシュ描画ループ (if文の外にあること！)
-        for (int i = 0; i < g_RenderMeshes.size(); ++i) {
-            const auto& m = g_RenderMeshes[i];
-
-            // ブロック判定 (非表示ロジック)
-            bool isBlocked = false;
-            for (const auto& bw : g_KeywordBlockedList) {
-                if (!bw.empty() && m.name.find(bw) != std::string::npos) {
-                    isBlocked = true;
+        // ★カラバリ: 選択中レコードの AlternateTextures（gender に応じ male/female）を取得。
+        //   テクスチャモード時、3D Index（or shape 名）が一致するメッシュは NIF ベースを上書き。
+        const std::vector<AltTex>* altList = nullptr;
+        if (g_TextureMode && g_SelectedRecordID >= 0) {
+            for (const auto& rec : g_AllRecords) {
+                if (rec.id == g_SelectedRecordID) {
+                    altList = (g_TargetGender == 1) ? &rec.altFemale : &rec.altMale;
                     break;
                 }
             }
-            if (isBlocked) continue; // ブロックされていればスキップ
-
-            // 描画
-            glm::vec3 c = m.color;
-            if (i == g_SelectedMeshIndex) c = glm::vec3(1.2f, 1.2f, 1.2f); // 選択中は明るく
-
-            glUniform3f(glGetUniformLocation(g_ShaderProgram, "objectColor"), c.r, c.g, c.b);
-            glBindVertexArray(m.VAO);
-            glDrawElements(GL_TRIANGLES, (GLsizei)m.indexCount, GL_UNSIGNED_INT, 0);
         }
 
-        // 3. 後処理 (ImGuiの描画より前に置くこと)
+        // ★カラバリ: メッシュへの上書き diffuse を解決するヘルパー。
+        //   主キー= 3D Index（mesh.shapeIndex 一致）、無ければ shape 名（case-insensitive）。
+        auto resolveAltDiffuse = [&](const RenderMesh& m) -> std::string {
+            if (!altList) return "";
+            for (const auto& a : *altList)            // 主: index 一致
+                if (a.index >= 0 && a.index == m.shapeIndex) return a.diffuse;
+            for (const auto& a : *altList) {          // フォールバック: 名前一致
+                if (a.shape.empty()) continue;
+                if (a.shape.size() == m.name.size()
+                    && std::equal(a.shape.begin(), a.shape.end(), m.name.begin(),
+                        [](char x, char y) { return ::tolower((unsigned char)x) == ::tolower((unsigned char)y); }))
+                    return a.diffuse;
+            }
+            return "";
+        };
+
+        // ★診断: 選択レコード/性別が変わったら、カラバリ上書きを 1 回ダンプする。
+        if (LogVerbose()) {
+            static int s_lastAltRec = -2; static int s_lastAltGender = -1;
+            if (g_SelectedRecordID != s_lastAltRec || g_TargetGender != s_lastAltGender) {
+                s_lastAltRec = g_SelectedRecordID; s_lastAltGender = g_TargetGender;
+                if (altList) {
+                    AddLog("[Alt] record " + std::to_string(g_SelectedRecordID)
+                        + (g_TargetGender == 1 ? " (Female)" : " (Male)")
+                        + ": " + std::to_string(altList->size()) + " override(s).", LogType::Info);
+                    for (const auto& a : *altList)
+                        AddLog("[Alt]   shape=\"" + a.shape + "\" index=" + std::to_string(a.index) + " -> " + a.diffuse, LogType::Info);
+                    for (const auto& m : g_RenderMeshes)
+                        AddLog("[Alt]   NIF mesh idx=" + std::to_string(m.shapeIndex) + " name=\"" + m.name + "\"", LogType::Info);
+                }
+                else if (g_TextureMode && g_SelectedRecordID >= 0) {
+                    AddLog("[Alt] record " + std::to_string(g_SelectedRecordID) + ": no overrides (using base diffuse).", LogType::Info);
+                }
+            }
+        }
+
+        // ★A1: 透過描画を正しくするための統一処理。
+        //   1 メッシュを描く drawOne（ref/main 共通）。isRef でテクスチャ解決先を切替。
+        auto drawOne = [&](const RenderMesh& m, bool isRef, int mainIdx) {
+            unsigned int tex = 0;
+            if (g_TextureMode) {
+                if (isRef) {
+                    if (strlen(g_RefTexFolder) > 0 && !m.diffuseTexPath.empty())
+                        tex = GetOrLoadTextureFromFolder(g_RefTexFolder, m.diffuseTexPath);
+                }
+                else {
+                    std::string texPath = m.diffuseTexPath;
+                    std::string altDiff = resolveAltDiffuse(m); // カラバリ: index 優先で上書き
+                    if (!altDiff.empty()) texPath = altDiff;
+                    if (!texPath.empty()) tex = GetOrLoadDiffuseTexture(texPath);
+                }
+            }
+            bool textured = (tex != 0);
+            glUniform1i(glGetUniformLocation(g_ShaderProgram, "useTexture"), textured ? 1 : 0);
+            if (textured) {
+                glm::vec3 tint = (!isRef && mainIdx == g_SelectedMeshIndex) ? glm::vec3(1.4f) : glm::vec3(1.0f);
+                glUniform3f(glGetUniformLocation(g_ShaderProgram, "tint"), tint.r, tint.g, tint.b);
+                glActiveTexture(GL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_2D, tex);
+                // ★#3: 法線マップ。モデルスペース(_msn)は接線スペース適用が誤りなので除外。
+                unsigned int ntex = 0;
+                if (g_UseNormalMap && m.hasTangents && !m.modelSpaceNormal && !m.normalTexPath.empty())
+                    ntex = isRef ? GetOrLoadTextureFromFolder(g_RefTexFolder, m.normalTexPath)
+                                 : GetOrLoadDiffuseTexture(m.normalTexPath);
+                if (ntex != 0) {
+                    glActiveTexture(GL_TEXTURE1);
+                    glBindTexture(GL_TEXTURE_2D, ntex);
+                    glActiveTexture(GL_TEXTURE0);
+                }
+                glUniform1i(glGetUniformLocation(g_ShaderProgram, "useNormal"), ntex != 0 ? 1 : 0);
+                // ★#3-alpha: 完全透過部の黒残り対策。
+                bool doDiscard = m.alphaTest || m.alphaBlend;
+                float thr = m.alphaTest ? m.alphaThreshold : 0.02f;
+                glUniform1i(glGetUniformLocation(g_ShaderProgram, "useAlphaTest"), doDiscard ? 1 : 0);
+                glUniform1f(glGetUniformLocation(g_ShaderProgram, "alphaThreshold"), thr);
+                // 半透明は depth 書き込み OFF（透過2パスのソートに任せる）。
+                if (m.alphaBlend) { glEnable(GL_BLEND); glDepthMask(GL_FALSE); }
+                else { glDisable(GL_BLEND); glDepthMask(GL_TRUE); }
+            }
+            else {
+                glm::vec3 c = m.color;
+                if (!isRef && mainIdx == g_SelectedMeshIndex) c = glm::vec3(1.2f, 1.2f, 1.2f);
+                glUniform3f(glGetUniformLocation(g_ShaderProgram, "objectColor"), c.r, c.g, c.b);
+                glUniform1i(glGetUniformLocation(g_ShaderProgram, "useNormal"), 0);
+                glUniform1i(glGetUniformLocation(g_ShaderProgram, "useAlphaTest"), 0);
+                glDisable(GL_BLEND); glDepthMask(GL_TRUE);
+            }
+            glBindVertexArray(m.VAO);
+            glDrawElements(GL_TRIANGLES, (GLsizei)m.indexCount, GL_UNSIGNED_INT, 0);
+        };
+
+        // ★A1: 描画アイテムを収集（ref + main）。半透明 = texture mode かつ alphaBlend。
+        struct DrawItem { const RenderMesh* m; bool isRef; int mainIdx; bool transparent; float depth; };
+        std::vector<DrawItem> drawItems;
+        auto isMeshBlocked = [&](const RenderMesh& m) {
+            for (const auto& bw : g_KeywordBlockedList)
+                if (!bw.empty() && m.name.find(bw) != std::string::npos) return true;
+            return false;
+        };
+        if (g_ShowRef && !g_RefRenderMeshes.empty())
+            for (const auto& m : g_RefRenderMeshes)
+                drawItems.push_back({ &m, true, -1, g_TextureMode && m.alphaBlend, 0.0f });
+        for (int i = 0; i < (int)g_RenderMeshes.size(); ++i) {
+            const auto& m = g_RenderMeshes[i];
+            if (isMeshBlocked(m)) continue; // ブロックは非表示
+            drawItems.push_back({ &m, false, i, g_TextureMode && m.alphaBlend, 0.0f });
+        }
+
+        // ★A1: パス1 = 不透明（depth 書き込みあり）。順序は問わない。
+        for (const auto& it : drawItems)
+            if (!it.transparent) drawOne(*it.m, it.isRef, it.mainIdx);
+
+        // ★A1: パス2 = 半透明。ビュー空間 Z で奥→手前にソートして描く（depth 書き込みは drawOne 内で OFF）。
+        std::vector<const DrawItem*> trans;
+        for (const auto& it : drawItems) if (it.transparent) trans.push_back(&it);
+        for (auto* it : trans) {
+            glm::vec4 vp = view * model * glm::vec4(it->m->center, 1.0f);
+            const_cast<DrawItem*>(it)->depth = vp.z; // view 空間 z（負ほど遠い）
+        }
+        std::sort(trans.begin(), trans.end(),
+            [](const DrawItem* a, const DrawItem* b) { return a->depth < b->depth; }); // 遠い(負)が先
+        for (auto* it : trans) drawOne(*it->m, it->isRef, it->mainIdx);
+
+        // 3. 後処理 (3D描画の状態リセット)
+        glDisable(GL_BLEND); glDepthMask(GL_TRUE); glBindTexture(GL_TEXTURE_2D, 0); // ★Tier3: 状態リセット
         glBindVertexArray(0);
+
+        // ★FBO を解除して既定フレームバッファへ。背景クリア後に ImGui を描画
+        //   （ImGui の "3D Viewport" Image が上で描いた FBO テクスチャを表示する）
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        int dw, dh; glfwGetFramebufferSize(window, &dw, &dh);
+        glViewport(0, 0, dw, dh);
+        glClearColor(clear_color.x, clear_color.y, clear_color.z, clear_color.w);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         glfwSwapBuffers(window);
     }
+
+    // ★A2: detach ワーカーがまだ生きている可能性がある。終了処理（GL/テクスチャ破棄・静的 ofstream の
+    //   破棄等）の前にキャンセルを要求し、g_IsProcessing が下りるまで最大 ~5s 待つ。生存中ワーカーの
+    //   g_AllRecords/AddLog アクセスと片付けが競合して UB/クラッシュになるのを防ぐ。
+    //   （子プロセス待ちは A3 でタイムアウト/キャンセル化済みなので概ね 5s 以内に収束する。）
+    g_CancelRequested = true;
+    for (int i = 0; i < 100 && g_IsProcessing.load(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    if (g_IsProcessing.load())
+        AddLog("Shutdown: a background worker did not finish in time; exiting anyway.", LogType::Warning);
+
+    // ★② 終了時の GL リソース解放（GL コンテキストが有効なうちに行う）。
+    //   OS もプロセス終了時に回収するが、明示解放で検出ツールのノイズを減らし意図を明確化。
+    g_RenderMeshes.clear();      // 各 RenderMesh デストラクタで VAO/VBO/EBO 解放
+    g_RefRenderMeshes.clear();
+    ClearTextureCache();         // キャッシュ内の全 GL テクスチャ解放
+    if (g_ShaderProgram) { glDeleteProgram(g_ShaderProgram); g_ShaderProgram = 0; }
+    if (g_ViewColor) { glDeleteTextures(1, &g_ViewColor); g_ViewColor = 0; }
+    if (g_ViewDepth) { glDeleteRenderbuffers(1, &g_ViewDepth); g_ViewDepth = 0; }
+    if (g_ViewFBO) { glDeleteFramebuffers(1, &g_ViewFBO); g_ViewFBO = 0; }
 
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();

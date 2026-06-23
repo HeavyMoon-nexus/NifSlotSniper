@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
-// ���[���ݒ�E�B���h�E��`�悷��֐�
+// ルール設定ウィンドウを描画する関数
 void RenderRulesWindow();

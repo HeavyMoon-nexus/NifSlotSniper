@@ -1,4 +1,4 @@
-#pragma once
+ï»¿#pragma once
 
-// •Û—¯ƒŠƒXƒgiItems Pending savej‚ğ•`‰æ‚·‚éŠÖ”
+// ä¿ç•™ãƒªã‚¹ãƒˆï¼ˆItems Pending saveï¼‰ã‚’æç”»ã™ã‚‹é–¢æ•°
 void RenderPendingArea();

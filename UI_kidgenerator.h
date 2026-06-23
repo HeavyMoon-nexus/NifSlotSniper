@@ -1,4 +1,4 @@
-#pragma once
+ï»¿#pragma once
 
-// KID Generator ƒEƒBƒ“ƒhƒE‚ğ•`‰æ‚·‚éŠÖ”
+// KID Generator ã‚¦ã‚£ãƒ³ãƒ‰ã‚¦ã‚’æç”»ã™ã‚‹é–¢æ•°
 void RenderKidGenerator();
