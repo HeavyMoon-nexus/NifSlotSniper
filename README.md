@@ -1,219 +1,291 @@
-This tool is released under the MIT License. See the License section below for details.
-This tool makes it easy to change and bulk sync armor slots between nif and esp.
-You can also change the slot of the original nif for Bodyslide.
+# NIF Slot Sniper 2.0.0
 
+NIF Slot Sniper (NSS) is a GUI tool for Skyrim SE/AE that lets you view, edit, and bulk-synchronize
+**biped armor slots** between `.nif` meshes and `.esp`/`.esl` records. It can also rewrite the slots of
+original BodySlide `.nif` files.
 
-```mermaid
-flowchart
-    classDef tool fill:#f9f,stroke:#333,stroke-width:2px,color:black;
-    classDef file fill:#ff9,stroke:#333,stroke-width:1px,color:black;
-    classDef nss fill:#f00,stroke:#333,stroke-width:4px,color:white,font-weight:bold;
-    classDef enda fill:#f00AAAAA,stroke:#333,stroke-width:4px
-    classDef empty fill:none,stroke:none,color:#0000000;
-    subgraph step1["<div style='min-width: 250px'>Step 1:Preparation (Synthesis)</div>"]
-        direction TB
-        A[Start] ==> B[Synthesis<br>slotEXporter]:::tool
-        B --> C[("slotdata-export.txt")]:::file
-    end
-    subgraph Step2["<div style='min-width: 250px'>Step 2:Editing (Nif Slot Sniper)</div>"]
-        direction TB
-        C ==> NSS(((Nif Slot Sniper))):::nss
-        NifIn[".nif (_0, _1)"]:::file -. "Auto load .nif pair from slotdata-*.txt" .-> NSS
-        OspIn[".osp (BodySlide)"]:::file -."Auto load .nif form .osp".-> NSS
-        NSS <==> D["slotdata-output.txt <br> (overwrite/slotdataTXT)"]:::file
-        NSS --> NifOut["Changed .nif<br>(_0,_1)"]:::file
-        NSS -.-> OspOut["Changed .nif<br>(for BodySlide)"]:::file
-    end
+Released under the MIT License (see [License](#license)).
 
-    subgraph Step3["<div style='min-width: 500px'>Step 3: Finalize&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp&nbsp</div>"]
-        direction TB
-        NifOut ==> NifFold[Place it in the right place]:::anda
-        D ==> E[Synthesis<br>slotIMporter]:::tool
-        E --> F["Created .esp<br>(overwrite/GeneratedReplacers)<br>Place it in the right place"]:::anda
-        
-        OspOut -.-> BS[Run BodySlide]:::tool
-    end
-Mo2[This tool is designed to run on ModOrganizer2.]
-    linkStyle default stroke-width:2px,fill:none,stroke:#333
+> **Designed to run under Mod Organizer 2.** Launching through MO2 is required so that the virtual file
+> system (USVFS) resolves the correct load order and loose textures.
+
+---
+
+## What's new in 2.0.0
+
+2.0.0 is a major rewrite. If you are coming from 1.0.0, please read [Migrating from 1.0.0](#migrating-from-100).
+
+- **Synthesis is no longer required.** The old `slotEXporter` / `slotIMporter` Synthesis patchers are
+  replaced by a standalone CLI, `slottool.exe` (Mutagen / .NET 8), which the GUI runs for you. Like its
+  predecessors, `slottool` is published as a **separate project** with its own repository and license.
+- **Per-mesh slots.** Slots are now tracked per mesh (NIF partition) instead of as a single ARMA union,
+  so multi-slot outfits export correctly.
+- **JSON edit history.** `slotdata-Output.txt` is replaced by `slotdata-ChangeSet.json` (not compatible
+  with the old text format — a one-click converter is provided).
+- **Direct Overwrite mode**, **BSD ⇄ NiSkin conversion**, **texture rendering** (diffuse, alpha,
+  normal maps, AlternateTextures, BSA support), and a translucency-aware **KID Generator**.
+
+---
+
+## Requirements
+
+- Mod Organizer 2 (the tool reads the live load order through it).
+- `slottool.exe` — the companion CLI, distributed separately
+  (https://github.com/HeavyMoon-nexus/slottool). Place it anywhere and set its path under
+  **File → Settings**.
+- Optional: `BSArch.exe` (classic CLI build) to read textures packed inside `.bsa` archives. Set its path
+  in Settings. Loose textures work without it.
+
+---
+
+## Quick start
+
+1. **File → Settings**: set the **Game Data Path**, **Output Root**, **slottool path**, and (optionally)
+   **BSArch path**. Leave defaults for the rest.
+2. **NIF Database → Import DB (slottool)**: NSS runs `slottool export` against your live load order, then
+   reads each NIF to build per-mesh slot data. A browseable database tree appears (ESP → gender → NIF).
+3. Double-click a NIF to load it into the 3D viewport.
+4. In the **Control Panel**, pick a mesh, set the new slot(s), and press **Apply**. The change accumulates
+   in the **Item Pending Save** window.
+5. In the **Pending** window, tick what you want to write (**NIF / ESL / slotdata Json Out**) and press
+   **Export Pending**.
+
+---
+
+## Data flow
+
+```
+[live load order]
+      | slottool export (child process, inherits USVFS)
+      v
+ nss_slot_export.json (%TEMP%)
+      | Import DB: parse JSON -> records, then read each NIF for per-mesh slots + bones
+      v
+ in-memory database (browse tree; not persisted)
+      | select a row -> load NIF -> 3D viewport
+      | edit partitions -> Apply
+      v
+ Pending list (g_SessionChanges)
+      | Export Pending (NIF / ESL / ChangeSet json)
+      +-- NIF : write per-mesh partitions back into each shape
+      +-- ESL : slottool import -> <source>_SlotPatch.esp  (or Direct Overwrite to the origin plugin)
+      +-- json: update slotdata-ChangeSet.json (edit history / batch input)
 ```
 
+Alternate paths:
 
-NIF SLOT SNIPER 1.0.0
+- **Batch**: *Load slotdata → Pending* expands `slotdata-ChangeSet.json` into the Pending list so you can
+  re-export everything at once (useful for applying a downloaded ChangeSet).
+- **Convert**: *Convert old TXT → ChangeSet.json* migrates a legacy `slotdata-Output.txt` by reading the
+  NIFs to reconstruct per-mesh slots.
+- **OSP**: the **BodySlide OSP Browser** tab edits/exports BodySlide `.osp` source meshes directly.
 
-このNIF SLOT SNIPERというツールは、skyrim SE/AE用に、.esp,.nifのスロットを変更するためのものです。
-slotdata-export.txtとslotdata-output.txtのデータを使います。
-Mod Organizer2での使用を前提としています。
+---
 
+## The windows
 
+- **NIF Database** — the imported records as a tree (ESP / gender / NIF). Search filters support
+  `esp:`, `slot:`, and `mesh:` prefixes (exact match). NIFs whose on-disk partitions do not match the
+  ESP slots are highlighted orange after **Check NIF↔DB Slots**.
+- **Control Panel** — gender priority, texture mode, load mode, NIF loading, **Analyze Slots**, the Apply
+  buttons (This Mesh / per-partition / ALL), normal-map debug toggles, and **Load Ref Body**.
+- **Item Pending Save** — the queued edits and the unified **Export Pending** controls.
+- **Analysis Details** — explains *why* each slot was suggested (which rule added how many points).
+- **Settings** — all paths, texture cache size, log level, reference-body texture folder, Direct Overwrite,
+  and skeleton/costume-seed options.
 
-How to use
+**Load modes** (Control Panel): *Single* loads NIFs without `_0/_1`, *Pair* loads `_0/_1` body pairs,
+*Both* loads either (default). *BS OSP NIF* mode reads BodySlide `.osp` (press **Scan OSP Files**;
+not auto-loaded).
 
+---
 
+## Editing slots
 
-=====Synthesis nifslotEXporter
+- Select a mesh in the mesh list. Its current partition slots are shown per partition
+  (`[i] slot N (name)`).
+- Enter the new slot(s) manually, use the **per-partition editor** (one slot per partition), or take a
+  suggestion from **Analyze Slots**.
+- Press **Apply** to stage the change in **Item Pending Save**.
+- The number of slots you can write to a mesh is limited by its partition count; exceeding it is rejected.
 
-同梱しているSynthesisパッチ。実行すると、espからデータを取り出し、slotdata-export.txtが入手できる(.esp側元スロットデータ)
-Mo2環境なら overwrite\slotdataTXT に出力される。
+### Per-mesh model (why your block slots are preserved)
 
+The ESP `armaSlots` (BodyTemplate) can contain "block" slots that have **no geometry** (used to claim a
+slot so other gear can't occupy it). The NIF only has partitions for real geometry. NSS keeps these
+separate: on import it computes `blockingSlots = armaSlots − union(mesh slots)` and, after you edit,
+rebuilds `armaSlots = union(mesh slots) ∪ blockingSlots`. So editing a mesh's geometry slot never drops
+your block slots.
 
-=====Nif Slot Sniper
+The per-mesh truth lives in the NIF. Slots are read for the **currently displayed gender** only (half the
+cost); to capture the other gender, switch gender and re-run **Import DB**.
 
-1.slotdata-export.txt→slotdata-output.txtの順番で自動的に読み込む。
+---
 
-2.Nif databaseウィンドウに一覧が表示される。
-2-tips:Control Panelからnif読み込みの優先gender,及び読み込みモードが選択できる。
-2-tips:Singleモード:_0,_1のないnifを読み込む。Pairモード:_0,_1のあるnifを読み込む。bothモード:SingleとPairの両方（既定）
-2-tips:BS OSP NIFモード:Bodyslide用のxml形式の.ospを読み込む。bodyslide処理前の元データ用。自動読み込みしないので、[Scan OSP Files]すると読み込む。
+## Export options
 
-3.Nif databaseからnifを選択すると3Dで表示される。Control Panelにnif名や内部のmeshesが表示される。
-3-Tips:DB slotsには、slotdata-*.txtに記載されているスロットが表示される。
-3-tips: [Load Ref Body]ボタンで素体を表示し、装備の重なりを確認できる。[Show Ref]をオンにして表示。(既定では非表示)
-3-tips: メニューバーの [Analysis Details] ウィンドウを開くと、なぜそのスロットが提案されたのか（どのルールで何点加算されたか）の詳細な内訳を確認できる。
+In the Pending window, **Export Pending** writes the ticked outputs:
 
-4.meshes listからmeshを選択。
-4-A.slotdata-*.txtのスロット情報がDB slotに表示される。
-4-B.slotdata-*.txtとは異なるスロットをマニュアル入力もしくはAnalyze機能（後述）で適用(仮設定)できる。
+- **NIF** — writes each shape's partition from the per-mesh data. Output goes under
+  `Output Root/meshes/...`. Pair NIFs (`_0/_1`) are handled together.
+- **ESL** — runs `slottool import` to produce `<source>_SlotPatch.esp`. If a patch already exists it is
+  loaded and merged (existing FormKeys are updated, new ones added).
+- **slotdata Json Out** — merges the edits into `slotdata-ChangeSet.json` (your portable edit history).
 
-5.Apply Changeボタンを押すと、スロット変更分がItem Pending Saveウィンドウに蓄積されていく。(本設定)
-5-Tips:nifのpartitionの数以下のスロットの個数しか入力できない仕様。エラーが出て、Applyできなくなります。
+### Direct Overwrite mode
 
-6.Item Pending Saveウィンドウの[Save TXT & Export NIFs]ボタンで出力できる。
+Enable **Direct Overwrite** in Settings to skip patch generation and write **into the original files**:
 
-7.ツールのメイン機能が終了。
+- The NIF is backed up once (`.bak`) and then overwritten in place.
+- The ESP slot change is written directly to the **defining plugin** via `slottool overwrite-original`
+  (also backed up to `.bak`). Records are routed to their origin plugin even if ARMA and ARMO live in
+  different mods.
 
-++++他の出力ボタンについて++++
-@Nif Databaseウィンドウ、Slotdata-Listタブの[Export Selected Nif]ボタン
-ダウンロードしたslotdata-*.txtを適用する場合に使用。
-チェックボックスにチェックを入れたものが出力される。念の為、slotdata-output.txtが出力/上書きされる。
-tips:チェックボックスで複数のnifを出力できる。Female nifとmale nifがあるが、ARMAで設定されたnifが片方の性別しか無い場合は、チェックした際に自動的に両性にチェックされる。
+This is destructive (off by default). When it is on, the Export button turns red and is decorated with
+`## DIRECT OVERWRITE ##`. The OSP path is not affected by this mode.
 
-@Nif Databaseウィンドウ、Bodyslide OSP Browserタブの[Export Checked Source]ボタン//廃止予定
-ダウンロードした編集済.ospを使って、bodyslideの元nifのスロット変更を連続処理するために使用。
-[Save TXT & Export NIFs]ボタンでも可能のため、極力使わないでください。
+### BSD ⇄ NiSkin conversion
 
-tips:右クリックで、.esp単位でブロックリストに入れることができる。
-ブロックリストに入れたespで使用されるnifは、たとえチェックが入っていても出力されない。（例：男性用nifがskyrimバニラに指定されている場合など）
+- **Convert to NiSkin (remove slots)** turns the selected `BSDismemberSkinInstance` mesh into a plain
+  `NiSkinInstance`, removing it from the slot set; `armaSlots` is recomputed accordingly.
+- **Convert to BSD (add slot)** does the reverse, giving a NiSkin mesh a partition (default slot 32) so you
+  can assign slots to it.
 
-@Control Panelウィンドウ内[Write slotdata-output.txt]ボタン
-Mesh listでスロットを変更した時に出現。
-nifを出力せず、slotdata-output.txtのみを出力/上書きします。
+Conversions are persisted in the ChangeSet and re-applied on export (and to the original NIF under Direct
+Overwrite).
 
-tips:slotdata-output.txtのみ出力した場合は.nifは変更されない為、Nif databaseウィンドウの[ReloadTXT]ボタンを押し、slotdata-output.txtを再読み込みすることで4.から始めることが可能。
+---
 
+## Analyze Slots (slot suggestion)
 
+`slottool export` usually returns vanilla slots, so setting each piece by hand is tedious. **Analyze Slots**
+(Control Panel) proposes the **1st / 2nd / 3rd** most likely slots for the selected mesh using a scoring
+system. Pick one, then **Apply** as usual. Open **Analysis Details** to see the score breakdown.
 
-slotdata-output.txtは、gamedataに設定しているフォルダ以下のslotdataTXTフォルダに出力される。
-（フォルダを変更している場合は、slotIMporterのtxt読み込み先をSynthesis内User settingsから修正してください。）
-nifslotIMporterに続く。
+Rules (edit them in **Settings → Auto-Fix Rules**):
 
+- **Name Rules** — award a score to a slot when a search word matches the mesh name or EditorID.
+- **Bone Rules** — award a score when a search word matches one of the mesh's skin bones (physical
+  position).
+- **Combo Rules** — award a bonus only when *all* listed bones are present on the mesh (e.g. `L foot`,
+  `R foot`). Most reliable.
 
-=====Synthesis nifslotIMporter
+A good ordering of weights is **Combo Rules > Name Rules > Bone Rules**.
 
-同梱しているSynthesisパッチ。実行すると、espにスロットデータを上書きし、.nif-.esp間でのスロット同期が完了する。
-。
-User settingsで選択したフォルダに出力される。
-gamedata pathを選択した場合は、既定でoverwrite/GeneratedReplacersフォルダに出力されるので、手動でファイル移動してください。
-Absolute pathを選択した場合は、Mo2フォルダ/mods以下に専用のフォルダを作り、そのフォルダを指定すると楽です。
+---
 
-Q. Synthesis (SlotImporter) で Lower FormKey range was violated というエラーが出て出力されないModがある
+## Texture display
 
-A. そのModはESLファイル（またはESPFE）として不正なFormIDを含んでいます。 Nif Slot Sniperの問題ではなく、対象Modのデータ構造の問題です。
+Toggle **Texture Mode** to render diffuse + alpha + double-sided materials, plus normal maps and a light
+specular term. Notes:
 
-対処法: SSEEdit (xEdit) でそのModを開き、対象Modを右クリックして "Compact FormIDs for ESL" を実行し、保存してください。これにより正しいFormIDが割り振られ、エラーが解消されます。
+- Loose textures are read directly; textures inside `.bsa` are read via BSArch (indexed once, then
+  unpacked on demand into a temp cache).
+- **AlternateTextures** (color variants defined on the ESP record) override the baked NIF textures for the
+  selected record. Re-run **Import DB** after upgrading so these fields are present.
+- Body meshes use model-space normals (`_msn`) and are excluded from tangent-space normal mapping
+  automatically; outfit normals (`_n`) get the effect.
+- **Load Ref Body** shows a reference body so you can check overlap; turn on **Show Ref** to display it
+  (hidden by default). Its textures can be resolved from a dedicated **Ref Body Texture Folder** in
+  Settings.
 
-////////////////////////////////////////////////////////////
-このツールで出力されるもの
-exeと同じフォルダ
-・imgui.ini - ウィンドウの設定が保存されています。
-・config.ini - 入出力するパス、個人的につけたスロットの名前、ブロックリストが保存されています。
+---
 
-出力先フォルダ
-・slotdata-*.txtからのnifファイル - 設定したパスの下にmeshesフォルダを作り、以下に出力します。
-・osp由来の.nifファイル - 設定したフォルダの下にCalienteTools/Bodyslide/ShapeDataフォルダ階層を作り、その下に出力します。
-・*_KID.ini - 設定したフォルダに出力されます。espごとに出力されます。既に存在する場合は追記します。
+## KID Generator
 
-overwrite/slotdataTXTフォルダ
-・slotdata-output.txt - このツールで編集したデータが出力されます。[ReloadTXT]でツール内にリロードできます。
+Generates `_KID.ini` files for the Keyword Item Distributor (Type is fixed to `Armor`).
 
-//////////////////////////
-★スロット解析機能 (Analyze Slots) について
-Nif Slot Sniperのメイン機能はnifのスロット変更であるが、slotdata-*.txtにより一括変更が可能になっている。
-しかしsynthesisで作成したslotdata-export.txtは基本的にバニラのスロットデータであると想定すると、NifSlotSniperなどで一つづつ設定するいつようが出てくる。
-スロットデータを特定の条件に基づきこのツールから提案させることで、一つづつ設定する手間を減らすことができる。
-使い方
-1.Meshes Listからmeshを選択する。
-2.Control Panel内[Analyze Slots]から起動
-3.設定した条件に基づき、スロット提案を1st 2nd 3rdの3つを表示する。
-3-tips: [Analysis Details] ウィンドウを開くと、採点の内訳（「Skirtという名前で+50点」など）を確認できる。
-3-tips:条件は、settings->Auto-Fixタブで設定できる。（後述）
-3-tips:順位は、後述の得点システムにより算出される。
-4.スロットを仮設定し、[Apply Change]で通常通りItem Pending Saveウィンドウに情報が反映される。
+- Type a keyword or pick one from the dropdown. Tick ARMOs in the NIF Database and **Add ARMOs to KID
+  List**, then **Generate String** and **Append to output_kid.ini** (written under Output Root, appended
+  if the file exists).
+- **Keyword Auto Pickup**: NSS inspects the loaded mesh and surfaces keywords linked by slot/name at the
+  top of the dropdown. `*` marks a slot or name match; `**` marks both.
+- **Translucency suggestion**: if any mesh uses alpha blending, sheer/translucent keywords are sorted to
+  the top and highlighted, with a hint in the header.
 
-★計算について
-加点方式。
-マイナス入力も可。
-点数の高いものから順に1st,2nd,3rdが表示される。
+---
 
-1.Name Rules
-Target:Nameモードのとき、Search wordsにslotとscoreを設定できる。
-Search Wordsが、メッシュ名やEditorIDにヒットしている場合に、そのslotにScoreを与える。
-そのアイテムがそう命名されているのなら可能性は高いだろう。
+## Blocked lists
 
-2.Bone Rules
-Target:Boneモードのとき、Search wordsにslotとscoreを設定できる。
-Search Wordsが、そのmeshが持っているボーンウェイトにヒットしている場合に、そのslotにScoreを与える。
-物理的な位置でScoreを与えたい場合に有効だろう。
+- Right-click an ESP in the NIF Database → **Add ESPs to BlockedList** to hide it and skip it from export
+  (e.g. a male NIF that points to vanilla Skyrim).
+- Right-click a mesh in the Control Panel's mesh list to add it to the Meshes BlockedList; it greys out and
+  is excluded from Analyze (so collision/unwanted bones aren't picked up).
+- Both lists are editable under **File → Settings**.
 
-3.Combo Rules
-Add New Combo Rule:欄で、keywordにslotとScoreを設定できる。
-keyword欄に入力されたkeywordを、表示しているmeshが持っているboneから検索し、そのすべてがヒットしている場合に、そのslotにBonusを与える。
-両足ならL foot,R footと入力する。Bone Rulesよりも確実性が高くなるだろう。基本設定値は高めが良いだろう。
+---
 
-COMBO Rules > Name Rules > Bone Rules
-の順で設定値を指定すると良いだろう。
-この設定は、画面左上のAuto-Fix Rulesから設定できる。
+## Files produced
 
-///////////////////////
-★slotniper-*.txtの形式
-SourceFile;ARMAFormID;ARMAEditorID;ARMOFormID;ARMOEditorID;MalePath;FemalePath;ARMOSlotNumber;ARMASlotNumber
-SourceFile      :espの名前。
-ARMAFormID      :アーマーアドオンのFormID
-ARMAEditorID    :アーマーアドオンのEditorID
-ARMOFormID      :アーマーのFormID
-ARMOEditorID    :アーマーのEditorID
-MalePath        :アーマーアドオンで男性用メッシュに指定されているnifのパス
-FemalePath      :アーマーアドオンで女性用メッシュに指定されているnifのパス
-ARMOSlotNumber  :**アーマー**のslot番号
-ARMASlotNumber  :**アーマーアドオン**のslot番号
+In the executable's folder:
 
-////////////////////
+- `imgui.ini` — window layout.
+- `config.ini` — paths, custom slot names, blocked lists, and options.
+- `keywords.json` — KID keyword list.
+- `nss_log.txt` — session log (3-generation rotation; level set in Settings).
+- `nss_permesh_cache.json` — per-mesh cache keyed by NIF path + mtime + size (delete to force a rebuild).
 
-*******KID Generator
-Keyword Item Distributorの_KID.iniを作成することができる。
+In your Output / data folders:
 
-@@@@@ How to use @@@@@
-search keywordに入力するか、プルダウンメニューから選択できる。
-Slotdata-*.txt起動読み込みに成功していたら、NIF databaseにespが一覧で表示されている。
-チェックボックスにチェックを入れ、[Add ARMOs to KID List]すると、下のフォームにEditorIDが転記される。
-[Generate String]すると、下のフォームに生成される。
-[Apend to output_kid.ini]すると、Output Rootで指定したフォルダに出力される。
+- Exported NIFs under `Output Root/meshes/...`.
+- OSP-derived NIFs under `CalienteTools/Bodyslide/ShapeData/...`.
+- `<source>_SlotPatch.esp` slot patches (unless using Direct Overwrite).
+- `*_KID.ini` per ESP (appended if present).
 
-)))))))))))))))))))) Keyword Auto Pickup ((((((((((((((((((((
-3D表示中のmeshの情報を読み込んで、slot,nameとリンク設定したkeywordを選出し、プルダウンメニュー上部に表示する。
-slotもしくはnameがヒットした場合、*がkeywordの左に表示される
-slotとnameが両方ヒットした場合、**がkeywordの左に表示される。
+In `slotDataPath` (default `slotdataTXT`):
 
-このツール自体が服装のnif向けに作っているため、TypeはArmorで固定している。
+- `slotdata-ChangeSet.json` — your edit history (also the batch input for *Load slotdata → Pending*).
+- `costume_seed.json` — optional export for downstream tools (see below).
 
-*******Blocked list
-NIF Databaseで右クリック -> Add ESPs to BlockedListでSource BlockedListに入り、非表示・出力不可にできる。
-Control Panel内Mesh Listでも右クリックするとMeshes BlockedListに入り、グレーアウトする。Auto-fixのAnalyze対象から外すことが出来る(CollisionBodyなどの不要なboneを取得しない)
-File -> Settingsウィンドウのタブから追加及び削除が可能。
+---
 
-/////Future
-・Textureの読み込み機能
-・複数のnifをrefとして読み込む機能
+## Migrating from 1.0.0
 
+- The 1.0.0 workflow (Synthesis `slotEXporter`/`slotIMporter` + `slotdata-Output.txt`) is gone. Build your
+  database with **Import DB (slottool)** instead.
+- `slotdata-Output.txt` is **not** read by 2.0.0. To keep old edits, use **Convert old TXT →
+  ChangeSet.json** once; NSS reads the NIFs to reconstruct per-mesh slots (rows whose NIF can't be read
+  fall back to the union only).
+- The removed buttons **Export Selected NIF** and **Write slotdata-output.txt** are consolidated into the
+  Pending window's unified **Export Pending**.
+
+---
+
+## Advanced: costume seed (skin-bone extraction)
+
+For pipelines that attach skinned accessories to the skeleton without consuming a biped slot, NSS can emit
+a `costume_seed.json` describing each record's skinned shapes, their bone names, and whether those bones
+resolve against a target skeleton.
+
+- Set **Skeleton Path (Female/Male)** and enable **Export costume seed** in Settings.
+- The seed is written from the full database at the end of **Import DB / Convert** (independent of the
+  ChangeSet, so it never pollutes your edit history). Only records with at least one skinned shape are
+  included.
+- Bone resolution is a static pre-filter for the displayed gender, not a runtime guarantee; consumers
+  should re-check at load time. Each `id` is a stable Mutagen FormKey (`XXXXXX:Plugin.esp`) and should be
+  treated as an opaque key.
+
+---
+
+## Roadmap
+
+- Loading multiple NIFs as references for side-by-side comparison.
+- Routing per-mesh data through the OSP export path.
+
+---
+
+## FAQ
+
+**Q. `slottool import` reports "Lower FormKey range was violated" for some mods.**
+A. That mod is flagged ESL/ESPFE but contains FormIDs below the legal small-master range. Direct Overwrite
+handles this by preserving the original FormIDs. If you are generating patches and still hit it, open the
+mod in SSEEdit (xEdit), right-click it, run **Compact FormIDs for ESL**, and save.
+
+**Q. The viewport loaded a NIF but nothing appears.**
+A. Likely the Meshes BlockedList matched a mesh name. The log warns when every mesh in a NIF is hidden by
+the blocklist. Remove the matching word in Settings.
+
+---
 
 ## License
 
@@ -224,21 +296,25 @@ Copyright (c) 2026 HeavyMoon
 You are free to use, modify, and distribute this software, including for commercial purposes,
 as long as the original copyright notice and license text are included.
 
+The companion CLI `slottool` is a separate project with its own license and third-party notices (it uses
+Mutagen, GPL-3.0); see its repository. The notices below cover this GUI only.
+
 ### Third-Party Licenses
 
-This project includes third-party libraries that are distributed under their own licenses:
+This GUI includes third-party libraries that are distributed under their own licenses:
 
 - Nifly (MIT License)
 - Dear ImGui (MIT License)
 - GLFW (zlib/libpng License)
 - GLAD (MIT License)
 - OpenGL Mathematics (GLM) (MIT License)
-- TinyXML (zlib License)
+- TinyXML-2 (zlib License)
 - Khronos OpenGL / OpenGL ES headers (Apache License 2.0)
+- nlohmann/json (MIT License)
 
 The full text of each license can be found in the following files:
 
-- `LICENSE` — MIT License for Nif Slot Sniper
-- `THIRD_PARTY_LICENSES.md` — Third-party license notices
-- `Apache-2.0.txt` — Full text of the Apache License 2.0
+- `LIcenses/LICENSE` — MIT License for Nif Slot Sniper
+- `THIRD_PARTY_NOTICES.md` — Third-party license notices
+- `LIcenses/Apache-2.0.txt` — Full text of the Apache License 2.0
 - http://www.apache.org/licenses/LICENSE-2.0
