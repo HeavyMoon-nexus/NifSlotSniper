@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- ★B4: プロセス ACP を UTF-8 化する。これにより既存のナロー文字列経路（CreateFile/CreateProcess の
+     A 系、std::fstream、std::filesystem の narrow 変換）が UTF-8 として解釈され、非 ACP 文字を含む
+     パスでも I/O が成立する。Windows 10 1903 以降が必要。 -->
+<assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1">
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage>
+    </windowsSettings>
+  </application>
+</assembly>
