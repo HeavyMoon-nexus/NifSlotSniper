@@ -1,0 +1,23 @@
+{
+  "name": "nifslotsniper-gui",
+  "version-string": "2.0.0",
+  "description": "Dependencies for the NIF Slot Sniper GUI (C++). nlohmann/json and TinyXML-2 are vendored in the repository and are not listed here.",
+  "dependencies": [
+    "nifly",
+    "glfw3",
+    "glm",
+    {
+      "name": "glad",
+      "features": [
+        "loader"
+      ]
+    },
+    {
+      "name": "imgui",
+      "features": [
+        "glfw-binding",
+        "opengl3-binding"
+      ]
+    }
+  ]
+}
